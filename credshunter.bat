@@ -2,7 +2,7 @@
 setlocal DisableDelayedExpansion
 
 :: ============================================================================
-::  credshunter.bat  v2.4.0-bat
+::  credshunter.bat  v2.5.0-bat
 ::  CMD port of credshunter.ps1 for hosts without PowerShell.
 ::  Read-only. Never modifies the system.
 ::
@@ -19,7 +19,20 @@ setlocal DisableDelayedExpansion
 ::    credshunter.bat -Path C:\ -SkipSystem -MaxFileSizeMB 10
 :: ============================================================================
 
-set "VERSION=2.4.0-bat"
+:: Capture the inherited environment before scanner-owned variables are set.
+:: The snapshot remains inside the scanner temp workspace and is removed by
+:: the single cleanup path on help, normal completion, and errors.
+set "CH_TMPDIR=%TEMP%\credshunter_%RANDOM%_%RANDOM%"
+mkdir "%CH_TMPDIR%" 2>nul
+if not exist "%CH_TMPDIR%\" (
+    echo [x] Cannot create temporary workspace: %CH_TMPDIR%
+    exit /b 2
+)
+set > "%CH_TMPDIR%\environment.txt"
+set "ENV_SNAPSHOT=%CH_TMPDIR%\environment.txt"
+
+set "VERSION=2.5.0-bat"
+set /a EXITCODE=0
 
 set "PATHS="
 set "EXCLUDEPATHS="
@@ -35,6 +48,7 @@ set "NOSTAGE3="
 set "NOSTAGE4="
 set "NOSTAGE5="
 set "NOSTAGE6="
+set "NOSTAGE7="
 set "INCLUDEDATA="
 set "NODEFAULTEXCLUDE="
 set "NOSIZELIMIT="
@@ -73,6 +87,10 @@ if /I "%arg%"=="-NoStage6"    set "NOSTAGE6=1" & shift & goto ParseArgs
 if /I "%arg%"=="/NoStage6"    set "NOSTAGE6=1" & shift & goto ParseArgs
 if /I "%arg%"=="-NoGit"       set "NOSTAGE6=1" & shift & goto ParseArgs
 if /I "%arg%"=="/NoGit"       set "NOSTAGE6=1" & shift & goto ParseArgs
+if /I "%arg%"=="-NoStage7"    set "NOSTAGE7=1" & shift & goto ParseArgs
+if /I "%arg%"=="/NoStage7"    set "NOSTAGE7=1" & shift & goto ParseArgs
+if /I "%arg%"=="-NoEnv"       set "NOSTAGE7=1" & shift & goto ParseArgs
+if /I "%arg%"=="/NoEnv"       set "NOSTAGE7=1" & shift & goto ParseArgs
 if /I "%arg%"=="-IncludeData" set "INCLUDEDATA=1" & shift & goto ParseArgs
 if /I "%arg%"=="/IncludeData" set "INCLUDEDATA=1" & shift & goto ParseArgs
 if /I "%arg%"=="-NoDefaultExclude" set "NODEFAULTEXCLUDE=1" & shift & goto ParseArgs
@@ -91,7 +109,7 @@ goto ParseArgs
 :ShowUsage
 echo credshunter v%VERSION% - reusable-credential discovery (read-only, CMD)
 echo.
-echo Usage: credshunter.bat -Path ^<dir^> [options]
+echo Usage: credshunter.bat [-Path ^<dir^>] [options]
 echo.
 echo   -Path ^<dir^>          Directories to scan (stages 2-6)
 echo   -ExcludePath ^<dir^>   Directories to skip (stages 2-6)
@@ -102,8 +120,9 @@ echo   -MaxFileSizeMB ^<n^>   Skip files larger than n MB (default 5)
 echo   -NoSizeLimit         Disable the file-size cap
 echo   -OutputFile ^<file^>   Append a findings log
 echo   -SkipSystem          Skip stage 1 (OS checks)
-echo   -NoStage1..6         Skip an individual stage
+echo   -NoStage1..7         Skip an individual stage
 echo   -NoGit               Same as -NoStage6 ^(alias^)
+echo   -NoEnv               Same as -NoStage7 ^(alias^)
 echo   -Quiet               Reduce status noise
 echo   -NoColor             Strip colour codes
 echo   -Help                Show this help
@@ -111,10 +130,14 @@ echo.
 echo Examples:
 echo   credshunter.bat -Path C:\ -OutputFile loot.txt
 echo   credshunter.bat -Path C:\Users,C:\inetpub -SkipSystem
-goto :EOF
+echo   credshunter.bat -NoStage1 -NoStage2 -NoStage3 -NoStage4 -NoStage5 -NoStage6
+echo.
+echo Warning: Stage 7 prints matched NAME=VALUE assignments in plaintext.
+echo When -OutputFile is used, assignments are also written to the log.
+goto CleanupAndExit
 
 :ArgsDone
-if not defined PATHS goto ShowUsage
+if not defined PATHS if defined NOSTAGE7 if defined NOSTAGE1 goto ShowUsage
 setlocal EnableDelayedExpansion
 
 set "CR="
@@ -139,8 +162,7 @@ if not defined NOCOLOR (
     set "CNC=!ESC![0m"
 )
 
-set "TMPDIR=%TEMP%\credshunter_%RANDOM%"
-mkdir "%TMPDIR%" 2>nul
+set "TMPDIR=%CH_TMPDIR%"
 set "FILELIST=%TMPDIR%\allfiles.txt"
 set "PATTERNS=%TMPDIR%\patterns.txt"
 set "KEYPATTERNS=%TMPDIR%\keypatterns.txt"
@@ -153,8 +175,14 @@ set "GIT=%TMPDIR%\git.txt"
 set "CHECKED=%TMPDIR%\checked.txt"
 set "SKIPPED=%TMPDIR%\skipped.txt"
 set "GUAR=%TMPDIR%\guaranteed.txt"
+set "ENV_HIGH_MATCHES=%TMPDIR%\environment-high.txt"
+set "ENV_KEY_MATCHES=%TMPDIR%\environment-key.txt"
+set "ENV_NAMES=%TMPDIR%\environment-names.txt"
+set "ENV_OVERSIZED_NAMES=%TMPDIR%\environment-oversized.txt"
 
 echo. > "%DEDUP%"
+type nul > "%ENV_NAMES%"
+type nul > "%ENV_OVERSIZED_NAMES%"
 
 set /a MAXBYTES=%MAXSIZEMB% * 1048576
 if defined NOSIZELIMIT set /a MAXBYTES=536870912
@@ -329,9 +357,9 @@ set /a nKey=0
 set /a nInt=0
 set /a nName=0
 set /a nGit=0
+set /a nEnv=0
 set /a nCheck=0
 set /a nSkip=0
-set /a EXITCODE=0
 
 if not defined QUIET (
     echo.
@@ -384,8 +412,8 @@ if not defined NOSTAGE1 (
     call :Stage1_DotNetSecrets
 )
 
-if not defined PATHS goto SkipFileStages
-if defined NOSTAGE2 if defined NOSTAGE3 if defined NOSTAGE4 if defined NOSTAGE5 if defined NOSTAGE6 goto SkipFileStages
+if not defined PATHS goto RunStage7
+if defined NOSTAGE2 if defined NOSTAGE3 if defined NOSTAGE4 if defined NOSTAGE5 if defined NOSTAGE6 goto RunStage7
 
 call :BuildExclusions
 
@@ -421,10 +449,18 @@ if not defined NOSTAGE6 (
     echo   !CC!==== STAGE 6 -- Git repository discovery [SKIPPED] ==============!CNC!
 )
 
-:SkipFileStages
+:RunStage7
+if not defined NOSTAGE7 (
+    call :DoStage7
+) else if not defined QUIET (
+    echo.
+    echo   !CC!==== STAGE 7 -- Process environment discovery [SKIPPED] ========!CNC!
+)
+
 call :WriteSummary
 
-if exist "%TMPDIR%\" rmdir /S /Q "%TMPDIR%" 2>nul
+:CleanupAndExit
+if exist "%CH_TMPDIR%\" rmdir /S /Q "%CH_TMPDIR%" 2>nul
 exit /b %EXITCODE%
 
 :Stage1_AutoLogon
@@ -1028,6 +1064,102 @@ if not defined QUIET if !nGit! GTR 0 (
     for /f "usebackq delims=" %%L in ("%GIT%") do echo   %CB%%%L%CNC%
     endlocal
 )
+goto :EOF
+
+:DoStage7
+if not defined QUIET (
+    echo.
+    echo   !CC!==== STAGE 7 -- Process environment credential discovery =======!CNC!
+)
+type nul > "%ENV_HIGH_MATCHES%"
+type nul > "%ENV_KEY_MATCHES%"
+
+:: Index oversized assignments before findstr scans them. FOR /F only needs
+:: the name before the first '='; the value is probed through CMD substring
+:: expansion without placing the complete value on a command line.
+for /f "usebackq tokens=1 delims==" %%N in ("%ENV_SNAPSHOT%") do (
+    >nul echo(%%N| findstr /R /X /C:"[A-Za-z_][A-Za-z0-9_().-]*" >nul 2>&1
+    if !errorlevel!==0 call :CheckEnvOversized "%%N"
+)
+
+:: Match the startup snapshot as a file. Values are never expanded through
+:: CALL or delayed expansion; findstr copies the raw assignment to output/log.
+findstr /I /G:"%PATTERNS%" "%ENV_SNAPSHOT%" > "%ENV_HIGH_MATCHES%" 2>nul
+findstr /I /G:"%KEYPATTERNS%" "%ENV_SNAPSHOT%" > "%ENV_KEY_MATCHES%" 2>nul
+
+for /f "usebackq tokens=1 delims==" %%N in ("%ENV_KEY_MATCHES%") do (
+    >nul echo(%%N| findstr /R /X /C:"[A-Za-z_][A-Za-z0-9_().-]*" >nul 2>&1
+    if !errorlevel!==0 call :RecordEnvKey "%%N"
+)
+for /f "usebackq tokens=1 delims==" %%N in ("%ENV_HIGH_MATCHES%") do (
+    >nul echo(%%N| findstr /R /X /C:"[A-Za-z_][A-Za-z0-9_().-]*" >nul 2>&1
+    if !errorlevel!==0 call :RecordEnvHigh "%%N"
+)
+
+if not defined QUIET echo !CG![+] Stage 7 complete: !nEnv! environment variable^(s^) matched.!CNC!
+goto :EOF
+
+:RecordEnvName
+set "eCountName=%~1"
+findstr /I /X /L /C:"!eCountName!" "%ENV_NAMES%" >nul 2>&1
+if !errorlevel!==0 goto :EOF
+echo !eCountName!>> "%ENV_NAMES%"
+set /a nEnv+=1
+goto :EOF
+
+:CheckEnvOversized
+set "eSizeName=%~1"
+findstr /I /X /L /C:"!eSizeName!" "%ENV_OVERSIZED_NAMES%" >nul 2>&1
+if !errorlevel!==0 exit /b 0
+set "eProbe="
+call set "eProbe=%%%eSizeName%:~16384,1%%"
+if not defined eProbe exit /b 1
+echo !eSizeName!>> "%ENV_OVERSIZED_NAMES%"
+if not defined QUIET echo !CY![!] Skipping oversized environment variable: ENV:!eSizeName! ^(^>16 KiB^)!CNC!
+exit /b 0
+
+:RecordEnvHigh
+set "eName=%~1"
+if /I "!eName!"=="PWD" goto :EOF
+if /I "!eName!"=="OLDPWD" goto :EOF
+if /I "!eName!"=="CH_TMPDIR" goto :EOF
+call :CheckEnvOversized "!eName!"
+if !errorlevel!==0 goto :EOF
+set "eKey=[HIGH] process_env/credential_match ENV:!eName!"
+findstr /X /L /C:"!eKey!" "%DEDUP%" >nul 2>&1
+if !errorlevel!==0 goto :EOF
+echo !eKey!>> "%DEDUP%"
+echo !eKey!>> "%HIGH%"
+findstr /I /B /L /C:"!eName!=" "%ENV_HIGH_MATCHES%" >> "%HIGH%" 2>nul
+if not defined QUIET echo   !CR![HIGH]!CNC! !CD!process_env/credential_match!CNC!  !CY!ENV:!eName!!CNC!
+if not defined QUIET findstr /I /B /L /C:"!eName!=" "%ENV_HIGH_MATCHES%"
+if defined OUTPUTFILE echo [HIGH] process_env/credential_match ENV:!eName!>> "%OUTPUTFILE%"
+if defined OUTPUTFILE findstr /I /B /L /C:"!eName!=" "%ENV_HIGH_MATCHES%" >> "%OUTPUTFILE%"
+set /a nHigh+=1
+set /a EXITCODE=1
+call :RecordEnvName "!eName!"
+goto :EOF
+
+:RecordEnvKey
+set "eName=%~1"
+if /I "!eName!"=="PWD" goto :EOF
+if /I "!eName!"=="OLDPWD" goto :EOF
+if /I "!eName!"=="CH_TMPDIR" goto :EOF
+call :CheckEnvOversized "!eName!"
+if !errorlevel!==0 goto :EOF
+set "eKey=[KEY] process_env/private_key ENV:!eName!"
+findstr /X /L /C:"!eKey!" "%DEDUP%" >nul 2>&1
+if !errorlevel!==0 goto :EOF
+echo !eKey!>> "%DEDUP%"
+echo !eKey!>> "%KEY%"
+findstr /I /B /L /C:"!eName!=" "%ENV_KEY_MATCHES%" >> "%KEY%" 2>nul
+if not defined QUIET echo   !CM![KEY]!CNC! !CD!process_env/private_key!CNC!  !CY!ENV:!eName!!CNC!
+if not defined QUIET findstr /I /B /L /C:"!eName!=" "%ENV_KEY_MATCHES%"
+if defined OUTPUTFILE echo [KEY] process_env/private_key ENV:!eName!>> "%OUTPUTFILE%"
+if defined OUTPUTFILE findstr /I /B /L /C:"!eName!=" "%ENV_KEY_MATCHES%" >> "%OUTPUTFILE%"
+set /a nKey+=1
+set /a EXITCODE=1
+call :RecordEnvName "!eName!"
 goto :EOF
 
 :GitVisitFile
@@ -1751,6 +1883,7 @@ if not defined QUIET (
     echo   !CC!Auxiliary credential-related files .......... %nInt%!CNC!
     echo   !CY!Suspicious filenames ^(substring^) ............ %nName%!CNC!
     echo   !CB!Git repositories found ...................... %nGit%!CNC!
+    echo   !CR!Environment credential findings ............. %nEnv%!CNC!
     echo   !CB!OS locations checked ........................ %nCheck%!CNC!
     echo   !CD!Files skipped ^(size/binary/perm^) ............ %nSkip%!CNC!
 )
@@ -1763,9 +1896,9 @@ if defined OUTPUTFILE (
     echo   Auxiliary credential-related:    %nInt% >> "%OUTPUTFILE%"
     echo   Suspicious filenames:            %nName% >> "%OUTPUTFILE%"
     echo   Git repositories found:           %nGit% >> "%OUTPUTFILE%"
+    echo   Environment credential findings:  %nEnv% >> "%OUTPUTFILE%"
     echo   OS locations checked:            %nCheck% >> "%OUTPUTFILE%"
     echo   Files skipped:                   %nSkip% >> "%OUTPUTFILE%"
     if not defined QUIET echo !CB![*] Full log written to !CW!!OUTPUTFILE!!CNC!
 )
 goto :EOF
-
