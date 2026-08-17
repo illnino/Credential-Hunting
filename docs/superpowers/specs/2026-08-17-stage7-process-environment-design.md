@@ -1,7 +1,7 @@
 # Stage 7 Process Environment Credential Discovery Design
 
-**Date:** 2026-08-17  
-**Status:** Approved for specification  
+**Date:** 2026-08-17
+**Status:** Approved for specification
 **Target version:** 2.5.0
 
 ## Objective
