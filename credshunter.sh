@@ -56,6 +56,7 @@ STAGE2_SKIP=0
 STAGE3_SKIP=0
 STAGE4_SKIP=0
 STAGE5_SKIP=0
+STAGE6_SKIP=0
 NO_COLOR_FLAG=0
 SCAN_PATHS=()
 USER_EXCLUDE_PATHS=()
@@ -92,16 +93,18 @@ TMPDIR="$(mktemp -d -t credshunter.XXXXXX 2>/dev/null || mktemp -d /tmp/credshun
 HIGH_FILE="$TMPDIR/high.tsv"
 KEY_FILE="$TMPDIR/keys.tsv"
 NAME_FILE="$TMPDIR/names.tsv"
+GIT_FILE="$TMPDIR/git.tsv"
 INTEREST_FILE="$TMPDIR/interest.tsv"
 GUARANTEED_FILE="$TMPDIR/guaranteed.tsv"
 SKIPPED_FILE="$TMPDIR/skipped.tsv"
 CHECKED_FILE="$TMPDIR/checked.tsv"
 CANDIDATE_FILES="$TMPDIR/candidates.lst"
-touch "$HIGH_FILE" "$KEY_FILE" "$NAME_FILE" \
+touch "$HIGH_FILE" "$KEY_FILE" "$NAME_FILE" "$GIT_FILE" \
       "$INTEREST_FILE" "$GUARANTEED_FILE" "$SKIPPED_FILE" \
       "$CHECKED_FILE" "$CANDIDATE_FILES"
 
 declare -A SCANNED_PATHS   # canonical path -> 1, dedup across all stages
+declare -A GIT_MARKERS     # canonical .git marker path -> 1
 
 # ----------------------------------------------------------------------------
 #  Signal handling — Ctrl+C / SIGTERM exits immediately
@@ -256,7 +259,7 @@ they're the dominant source of false positives.
 
 Options:
   -p, --path PATH       Path to scan recursively (repeatable).
-  -x, --exclude PATH    Skip a directory tree (repeatable). Affects stages 2-5
+  -x, --exclude PATH    Skip a directory tree (repeatable). Affects stages 2-6
                         only; stage 1 (OS-level checks) is unaffected.
   -a, --all             Stage 5 scans every readable text file, not only
                         credential-related extensions.
@@ -269,6 +272,8 @@ Options:
       --no-stage3       Skip stage 3 (high-value file types).
       --no-stage4       Skip stage 4 (filename substring search).
       --no-stage5       Skip stage 5 (recursive content scan).
+      --no-stage6       Skip stage 6 (Git repository discovery).
+      --no-git          Same as --no-stage6 (alias).
   -q, --quiet           Reduce status noise. Findings still printed.
       --no-color        Strip ANSI escape codes.
   -h, --help            Show this help.
@@ -281,7 +286,7 @@ Examples:
   ./credshunter.sh -p / -x /var/lib/customer-app
 
 Exit codes:
-  0 = nothing sensitive found (INTEREST / NAME alone do not change the code)
+  0 = nothing sensitive found (INTEREST / NAME / GIT alone do not change the code)
   1 = at least one CRITICAL / HIGH / KEY finding
   2 = argument / I/O error
   130 = interrupted (Ctrl+C / SIGTERM)
@@ -438,6 +443,7 @@ parse_args() {
             --no-stage3)      STAGE3_SKIP=1; shift ;;
             --no-stage4)      STAGE4_SKIP=1; shift ;;
             --no-stage5)      STAGE5_SKIP=1; shift ;;
+            --no-stage6|--no-git) STAGE6_SKIP=1; shift ;;
             -q|--quiet)       QUIET=1; shift ;;
             --no-color)       NO_COLOR_FLAG=1; shift ;;
             -h|--help)        usage; exit 0 ;;
@@ -1016,6 +1022,22 @@ record_name() {
     printf '%s\n' "$REPLY" >>"$NAME_FILE"
     [ "$IN_STAGE1" -eq 1 ] && stage1_emit NAME "name_match" "$REPLY"
 }
+record_git() {
+    # Args: marker type, marker path. Canonicalise the parent so overlapping
+    # relative/absolute scan roots cannot emit the same repository twice.
+    local marker_type="$1" marker="$2" parent base canonical_parent root key
+    parent="${marker%/*}"; base="${marker##*/}"
+    [ "$parent" = "$marker" ] && parent='.'
+    canonical_parent=$(cd -P -- "$parent" 2>/dev/null && pwd) || canonical_parent="$parent"
+    if [ "$canonical_parent" = '/' ]; then marker="/$base"; else marker="$canonical_parent/$base"; fi
+    root="$canonical_parent"
+    _clean_path "$marker"; marker="$REPLY"
+    _clean_path "$root"; root="$REPLY"
+    key="$marker"
+    [ -n "${GIT_MARKERS[$key]:-}" ] && return 0
+    GIT_MARKERS["$key"]=1
+    printf '%s\t%s\t%s\n' "$marker_type" "$marker" "$root" >>"$GIT_FILE"
+}
 record_skip()        { _clean_path "$1"; printf '%s\t%s\n' "$REPLY" "$2" >>"$SKIPPED_FILE"; }
 record_checked()     { _clean_path "$2"; printf '%s\t%s\n' "$1" "$REPLY" >>"$CHECKED_FILE"; }
 record_guaranteed() {
@@ -1065,6 +1087,7 @@ end_progress() {
 declare -A STAGE_BEFORE_GUARANTEED
 declare -A STAGE_BEFORE_INTEREST
 declare -A STAGE_BEFORE_NAME
+declare -A STAGE_BEFORE_GIT
 declare -A STAGE_BEFORE_HIGH
 declare -A STAGE_BEFORE_KEY
 declare -A STAGE_START_TIME
@@ -1076,6 +1099,7 @@ stage_begin() {
     STAGE_BEFORE_GUARANTEED[$n]=$(wc -l <"$GUARANTEED_FILE" 2>/dev/null | tr -d ' ' || echo 0)
     STAGE_BEFORE_INTEREST[$n]=$(wc -l <"$INTEREST_FILE"   2>/dev/null | tr -d ' ' || echo 0)
     STAGE_BEFORE_NAME[$n]=$(wc -l <"$NAME_FILE"           2>/dev/null | tr -d ' ' || echo 0)
+    STAGE_BEFORE_GIT[$n]=$(wc -l <"$GIT_FILE"             2>/dev/null | tr -d ' ' || echo 0)
     STAGE_BEFORE_HIGH[$n]=$(wc -l <"$HIGH_FILE"           2>/dev/null | tr -d ' ' || echo 0)
     STAGE_BEFORE_KEY[$n]=$(wc -l <"$KEY_FILE"             2>/dev/null | tr -d ' ' || echo 0)
     STAGE_START_TIME[$n]=$(date +%s.%N 2>/dev/null || date +%s)
@@ -1092,19 +1116,21 @@ stage_end() {
     elapsed=$(awk -v a="${STAGE_START_TIME[$n]:-0}" -v b="$end" \
         'BEGIN{ d=b-a; if(d<0)d=0; printf "%.2f", d }')
 
-    local now_guar now_int now_name now_hi now_ky
+    local now_guar now_int now_name now_git now_hi now_ky
     now_guar=$(wc -l <"$GUARANTEED_FILE" 2>/dev/null | tr -d ' ' || echo 0)
     now_int=$(wc -l <"$INTEREST_FILE"    2>/dev/null | tr -d ' ' || echo 0)
     now_name=$(wc -l <"$NAME_FILE"       2>/dev/null | tr -d ' ' || echo 0)
+    now_git=$(wc -l <"$GIT_FILE"         2>/dev/null | tr -d ' ' || echo 0)
     now_hi=$(wc -l <"$HIGH_FILE"         2>/dev/null | tr -d ' ' || echo 0)
     now_ky=$(wc -l <"$KEY_FILE"          2>/dev/null | tr -d ' ' || echo 0)
 
     local d_guar=$(( now_guar - ${STAGE_BEFORE_GUARANTEED[$n]:-0} ))
     local d_int=$((  now_int  - ${STAGE_BEFORE_INTEREST[$n]:-0}   ))
     local d_name=$(( now_name - ${STAGE_BEFORE_NAME[$n]:-0}       ))
+    local d_git=$((  now_git  - ${STAGE_BEFORE_GIT[$n]:-0}         ))
     local d_hi=$((   now_hi   - ${STAGE_BEFORE_HIGH[$n]:-0}       ))
     local d_ky=$((   now_ky   - ${STAGE_BEFORE_KEY[$n]:-0}        ))
-    local total=$(( d_guar + d_int + d_name + d_hi + d_ky ))
+    local total=$(( d_guar + d_int + d_name + d_git + d_hi + d_ky ))
 
     local header="Stage $n -- $title" tw=72 fill
     fill=$(( tw - 6 - ${#header} )); [ "$fill" -lt 3 ] && fill=3
@@ -1119,6 +1145,7 @@ stage_end() {
         stage_print_delta KEY       "$KEY_FILE"        "${STAGE_BEFORE_KEY[$n]:-0}"        "$d_ky"
         stage_print_delta INTEREST  "$INTEREST_FILE"   "${STAGE_BEFORE_INTEREST[$n]:-0}"   "$d_int"
         stage_print_delta NAME      "$NAME_FILE"       "${STAGE_BEFORE_NAME[$n]:-0}"       "$d_name"
+        stage_print_delta GIT       "$GIT_FILE"        "${STAGE_BEFORE_GIT[$n]:-0}"        "$d_git"
     fi
 }
 
@@ -1146,6 +1173,10 @@ stage_print_delta() {
             ;;
         INTEREST|NAME)
             tail -n "+$start" "$file" | awk -F'\t' -v t="$tier" '{ p=$NF; printf "  [%-8s]  %s\n", t, p }'
+            ;;
+        GIT)
+            tail -n "+$start" "$file" | awk -F'\t' -v a="$GARROW" \
+                '{ printf "  [%-8s]  %-9s  %s  %s  %s\n", "GIT", $1, $2, a, $3 }'
             ;;
         CRITICAL)
             tail -n "+$start" "$file" | awk -F'\t' '{ printf "  [%-8s]  %s\n", "CRITICAL", $2 }'
@@ -1858,7 +1889,7 @@ reconcile_scan_path_excludes() {
 }
 
 # ============================================================================
-#  Stages 2-5 — recursive scanning of user-supplied paths
+#  Stages 2-6 — recursive scanning of user-supplied paths
 # ============================================================================
 
 # Build the find pruning expression ONCE as an argv ARRAY (no eval, no quoting
@@ -2076,6 +2107,57 @@ scan_user_paths_contents() {
 }
 
 # ============================================================================
+#  Stage 6 — Git repository discovery
+# ============================================================================
+
+# Stage 6 needs to observe .git directories and then prune them. The shared
+# exclusion expression cannot do that because .git is intentionally excluded
+# from stages 2-5 before their match expressions run. Build a second expression
+# containing every normal exclusion except the .git basename.
+FIND_GIT_EXCLUDE_ARGS=()
+build_git_find_excludes() {
+    [ "${#FIND_GIT_EXCLUDE_ARGS[@]}" -gt 0 ] && return
+    local d inner=()
+    for d in "${EXCLUDE_DIR_NAMES[@]}"; do
+        [ "$d" = '.git' ] && continue
+        inner+=( -o -type d -name "$d" )
+    done
+    for d in "${EXCLUDE_PATHS[@]}"; do
+        inner+=( -o -path "$d" -o -path "$d/*" )
+    done
+    [ "${#inner[@]}" -gt 0 ] && FIND_GIT_EXCLUDE_ARGS=( '(' "${inner[@]:1}" ')' -prune -o )
+}
+
+find_git_repositories() {
+    build_git_find_excludes
+    local path marker first
+    for path in "${SCAN_PATHS[@]}"; do
+        [ -e "$path" ] || continue
+        while IFS= read -r -d '' marker; do
+            [ -z "$marker" ] && continue
+            if [ -d "$marker" ]; then
+                record_git directory "$marker"
+                continue
+            fi
+            [ -f "$marker" ] || continue
+            if [ ! -r "$marker" ]; then
+                record_skip "$marker" 'unreadable_git_marker'
+                continue
+            fi
+            first=''
+            IFS= read -r first <"$marker" || [ -n "$first" ] || continue
+            first="${first%$'\r'}"
+            if [[ "$first" =~ ^[[:space:]]*gitdir:[[:space:]]*[^[:space:]] ]]; then
+                record_git file "$marker"
+            fi
+        done < <(find -H "$path" "${FIND_GIT_EXCLUDE_ARGS[@]}" \
+            '(' -type d -name '.git' -print0 -prune ')' -o \
+            '(' -type f -name '.git' -print0 ')' 2>/dev/null)
+    done
+    [ -s "$GIT_FILE" ] && sort -u "$GIT_FILE" -o "$GIT_FILE"
+}
+
+# ============================================================================
 #  Output / summary
 # ============================================================================
 
@@ -2141,6 +2223,16 @@ print_summary() {
         done <"$NAME_FILE"
     fi
 
+    if [ -s "$GIT_FILE" ]; then
+        print_section_header "Git repositories"
+        sort -u "$GIT_FILE" -o "$GIT_FILE"
+        local marker_type marker root
+        while IFS=$'\t' read -r marker_type marker root; do
+            printf '  %b[GIT]%b %-9s  %s  %s  %s\n' "$B" "$NC" "$marker_type" "$marker" "$GARROW" "$root"
+            log_line "[GIT] $marker_type  $marker  $GARROW  $root"
+        done <"$GIT_FILE"
+    fi
+
     if [ -s "$CHECKED_FILE" ]; then
         print_section_header "OS locations checked"
         sort -u "$CHECKED_FILE" -o "$CHECKED_FILE"
@@ -2167,12 +2259,13 @@ print_summary() {
     fi
 
     # Counts
-    local n_guar n_high n_key n_int n_name n_check n_skip
+    local n_guar n_high n_key n_int n_name n_git n_check n_skip
     n_guar=$( [ -s "$GUARANTEED_FILE" ] && wc -l <"$GUARANTEED_FILE" | tr -d ' ' || echo 0)
     n_high=$( [ -s "$HIGH_FILE" ]    && wc -l <"$HIGH_FILE"    | tr -d ' ' || echo 0)
     n_key=$(  [ -s "$KEY_FILE" ]     && wc -l <"$KEY_FILE"     | tr -d ' ' || echo 0)
     n_int=$(  [ -s "$INTEREST_FILE" ]&& wc -l <"$INTEREST_FILE"| tr -d ' ' || echo 0)
     n_name=$( [ -s "$NAME_FILE" ]    && wc -l <"$NAME_FILE"    | tr -d ' ' || echo 0)
+    n_git=$(  [ -s "$GIT_FILE" ]     && wc -l <"$GIT_FILE"     | tr -d ' ' || echo 0)
     n_check=$([ -s "$CHECKED_FILE" ] && wc -l <"$CHECKED_FILE" | tr -d ' ' || echo 0)
     n_skip=$( [ -s "$SKIPPED_FILE" ] && wc -l <"$SKIPPED_FILE" | tr -d ' ' || echo 0)
 
@@ -2182,6 +2275,7 @@ print_summary() {
     sum_row "$M"      "Private keys / auth material"           "$n_key"
     sum_row "$C"      "Auxiliary credential-related files"     "$n_int"
     sum_row "$Y"      "Suspicious filenames (substring)"       "$n_name"
+    sum_row "$B"      "Git repositories found"                  "$n_git"
     sum_row "$B"      "OS locations checked"                   "$n_check"
     sum_row "$D"      "Files skipped (size/binary/perm)"       "$n_skip"
 
@@ -2192,6 +2286,7 @@ print_summary() {
     log_line "  Private keys / material:         $n_key"
     log_line "  Auxiliary credential-related:    $n_int"
     log_line "  Suspicious filenames (substring):$n_name"
+    log_line "  Git repositories found:           $n_git"
     log_line "  OS locations checked:            $n_check"
     log_line "  Files skipped:                   $n_skip"
 
@@ -2219,7 +2314,7 @@ main() {
     fi
 
     if [ "${#USER_EXCLUDE_PATHS[@]}" -gt 0 ]; then
-        info "User exclusions (${W}${#USER_EXCLUDE_PATHS[@]}${NC}) — applied to stages 2-5 only:"
+        info "User exclusions (${W}${#USER_EXCLUDE_PATHS[@]}${NC}) — applied to stages 2-6 only:"
         local p
         for p in "${USER_EXCLUDE_PATHS[@]}"; do
             printf '       %b- %s%b\n' "$D" "$p" "$NC" >&2
@@ -2245,7 +2340,7 @@ main() {
     fi
 
     if [ ${#SCAN_PATHS[@]} -eq 0 ]; then
-        warn "No paths supplied (-p). Skipping stages 2-5."
+        warn "No paths supplied (-p). Skipping stages 2-6."
         warn "Tip: pass -p / to scan everything under root."
     else
         if [ "$STAGE2_SKIP" -eq 0 ]; then
@@ -2267,6 +2362,11 @@ main() {
             stage_begin 5; scan_user_paths_contents; stage_end 5 "Recursive content scan"
         else
             stage_skipped 5 "Recursive content scan"
+        fi
+        if [ "$STAGE6_SKIP" -eq 0 ]; then
+            stage_begin 6; find_git_repositories; stage_end 6 "Git repository discovery"
+        else
+            stage_skipped 6 "Git repository discovery"
         fi
     fi
 

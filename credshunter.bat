@@ -1,5 +1,5 @@
 @echo off
-setlocal EnableDelayedExpansion
+setlocal DisableDelayedExpansion
 
 :: ============================================================================
 ::  credshunter.bat  v2.4.0-bat
@@ -34,6 +34,7 @@ set "NOSTAGE2="
 set "NOSTAGE3="
 set "NOSTAGE4="
 set "NOSTAGE5="
+set "NOSTAGE6="
 set "INCLUDEDATA="
 set "NODEFAULTEXCLUDE="
 set "NOSIZELIMIT="
@@ -42,44 +43,48 @@ set "NOSIZELIMIT="
 if "%~1"=="" goto ArgsDone
 set "arg=%~1"
 set "val=%~2"
-if /I "!arg!"=="-Path"        set "PATHS=!PATHS!;!val!" & shift & shift & goto ParseArgs
-if /I "!arg!"=="/Path"        set "PATHS=!PATHS!;!val!" & shift & shift & goto ParseArgs
-if /I "!arg!"=="-ExcludePath" set "EXCLUDEPATHS=!EXCLUDEPATHS!;!val!" & shift & shift & goto ParseArgs
-if /I "!arg!"=="/ExcludePath" set "EXCLUDEPATHS=!EXCLUDEPATHS!;!val!" & shift & shift & goto ParseArgs
-if /I "!arg!"=="-OutputFile"  set "OUTPUTFILE=!val!" & shift & shift & goto ParseArgs
-if /I "!arg!"=="/OutputFile"  set "OUTPUTFILE=!val!" & shift & shift & goto ParseArgs
-if /I "!arg!"=="-MaxFileSizeMB" set /a MAXSIZEMB=!val! & shift & shift & goto ParseArgs
-if /I "!arg!"=="/MaxFileSizeMB" set /a MAXSIZEMB=!val! & shift & shift & goto ParseArgs
-if /I "!arg!"=="-All"          set "ALL=1" & shift & goto ParseArgs
-if /I "!arg!"=="/All"          set "ALL=1" & shift & goto ParseArgs
-if /I "!arg!"=="-Quiet"        set "QUIET=1" & shift & goto ParseArgs
-if /I "!arg!"=="/Quiet"        set "QUIET=1" & shift & goto ParseArgs
-if /I "!arg!"=="-NoColor"      set "NOCOLOR=1" & shift & goto ParseArgs
-if /I "!arg!"=="/NoColor"      set "NOCOLOR=1" & shift & goto ParseArgs
-if /I "!arg!"=="-SkipSystem"   set "SKIPSYSTEM=1" & set "NOSTAGE1=1" & shift & goto ParseArgs
-if /I "!arg!"=="/SkipSystem"   set "SKIPSYSTEM=1" & set "NOSTAGE1=1" & shift & goto ParseArgs
-if /I "!arg!"=="-NoStage1"    set "NOSTAGE1=1" & shift & goto ParseArgs
-if /I "!arg!"=="/NoStage1"    set "NOSTAGE1=1" & shift & goto ParseArgs
-if /I "!arg!"=="-NoStage2"    set "NOSTAGE2=1" & shift & goto ParseArgs
-if /I "!arg!"=="/NoStage2"    set "NOSTAGE2=1" & shift & goto ParseArgs
-if /I "!arg!"=="-NoStage3"    set "NOSTAGE3=1" & shift & goto ParseArgs
-if /I "!arg!"=="/NoStage3"    set "NOSTAGE3=1" & shift & goto ParseArgs
-if /I "!arg!"=="-NoStage4"    set "NOSTAGE4=1" & shift & goto ParseArgs
-if /I "!arg!"=="/NoStage4"    set "NOSTAGE4=1" & shift & goto ParseArgs
-if /I "!arg!"=="-NoStage5"    set "NOSTAGE5=1" & shift & goto ParseArgs
-if /I "!arg!"=="/NoStage5"    set "NOSTAGE5=1" & shift & goto ParseArgs
-if /I "!arg!"=="-IncludeData" set "INCLUDEDATA=1" & shift & goto ParseArgs
-if /I "!arg!"=="/IncludeData" set "INCLUDEDATA=1" & shift & goto ParseArgs
-if /I "!arg!"=="-NoDefaultExclude" set "NODEFAULTEXCLUDE=1" & shift & goto ParseArgs
-if /I "!arg!"=="/NoDefaultExclude" set "NODEFAULTEXCLUDE=1" & shift & goto ParseArgs
-if /I "!arg!"=="-NoSizeLimit" set "NOSIZELIMIT=1" & shift & goto ParseArgs
-if /I "!arg!"=="/NoSizeLimit" set "NOSIZELIMIT=1" & shift & goto ParseArgs
-if /I "!arg!"=="-Help"        goto ShowUsage
-if /I "!arg!"=="/Help"        goto ShowUsage
-if /I "!arg!"=="-h"           goto ShowUsage
-if /I "!arg!"=="/h"           goto ShowUsage
-if /I "!arg!"=="-?"           goto ShowUsage
-if /I "!arg!"=="/?"           goto ShowUsage
+if /I "%arg%"=="-Path"        set "PATHS=%PATHS%;%val%" & shift & shift & goto ParseArgs
+if /I "%arg%"=="/Path"        set "PATHS=%PATHS%;%val%" & shift & shift & goto ParseArgs
+if /I "%arg%"=="-ExcludePath" set "EXCLUDEPATHS=%EXCLUDEPATHS%;%val%" & shift & shift & goto ParseArgs
+if /I "%arg%"=="/ExcludePath" set "EXCLUDEPATHS=%EXCLUDEPATHS%;%val%" & shift & shift & goto ParseArgs
+if /I "%arg%"=="-OutputFile"  set "OUTPUTFILE=%val%" & shift & shift & goto ParseArgs
+if /I "%arg%"=="/OutputFile"  set "OUTPUTFILE=%val%" & shift & shift & goto ParseArgs
+if /I "%arg%"=="-MaxFileSizeMB" set /a MAXSIZEMB=%val% & shift & shift & goto ParseArgs
+if /I "%arg%"=="/MaxFileSizeMB" set /a MAXSIZEMB=%val% & shift & shift & goto ParseArgs
+if /I "%arg%"=="-All"          set "ALL=1" & shift & goto ParseArgs
+if /I "%arg%"=="/All"          set "ALL=1" & shift & goto ParseArgs
+if /I "%arg%"=="-Quiet"        set "QUIET=1" & shift & goto ParseArgs
+if /I "%arg%"=="/Quiet"        set "QUIET=1" & shift & goto ParseArgs
+if /I "%arg%"=="-NoColor"      set "NOCOLOR=1" & shift & goto ParseArgs
+if /I "%arg%"=="/NoColor"      set "NOCOLOR=1" & shift & goto ParseArgs
+if /I "%arg%"=="-SkipSystem"   set "SKIPSYSTEM=1" & set "NOSTAGE1=1" & shift & goto ParseArgs
+if /I "%arg%"=="/SkipSystem"   set "SKIPSYSTEM=1" & set "NOSTAGE1=1" & shift & goto ParseArgs
+if /I "%arg%"=="-NoStage1"    set "NOSTAGE1=1" & shift & goto ParseArgs
+if /I "%arg%"=="/NoStage1"    set "NOSTAGE1=1" & shift & goto ParseArgs
+if /I "%arg%"=="-NoStage2"    set "NOSTAGE2=1" & shift & goto ParseArgs
+if /I "%arg%"=="/NoStage2"    set "NOSTAGE2=1" & shift & goto ParseArgs
+if /I "%arg%"=="-NoStage3"    set "NOSTAGE3=1" & shift & goto ParseArgs
+if /I "%arg%"=="/NoStage3"    set "NOSTAGE3=1" & shift & goto ParseArgs
+if /I "%arg%"=="-NoStage4"    set "NOSTAGE4=1" & shift & goto ParseArgs
+if /I "%arg%"=="/NoStage4"    set "NOSTAGE4=1" & shift & goto ParseArgs
+if /I "%arg%"=="-NoStage5"    set "NOSTAGE5=1" & shift & goto ParseArgs
+if /I "%arg%"=="/NoStage5"    set "NOSTAGE5=1" & shift & goto ParseArgs
+if /I "%arg%"=="-NoStage6"    set "NOSTAGE6=1" & shift & goto ParseArgs
+if /I "%arg%"=="/NoStage6"    set "NOSTAGE6=1" & shift & goto ParseArgs
+if /I "%arg%"=="-NoGit"       set "NOSTAGE6=1" & shift & goto ParseArgs
+if /I "%arg%"=="/NoGit"       set "NOSTAGE6=1" & shift & goto ParseArgs
+if /I "%arg%"=="-IncludeData" set "INCLUDEDATA=1" & shift & goto ParseArgs
+if /I "%arg%"=="/IncludeData" set "INCLUDEDATA=1" & shift & goto ParseArgs
+if /I "%arg%"=="-NoDefaultExclude" set "NODEFAULTEXCLUDE=1" & shift & goto ParseArgs
+if /I "%arg%"=="/NoDefaultExclude" set "NODEFAULTEXCLUDE=1" & shift & goto ParseArgs
+if /I "%arg%"=="-NoSizeLimit" set "NOSIZELIMIT=1" & shift & goto ParseArgs
+if /I "%arg%"=="/NoSizeLimit" set "NOSIZELIMIT=1" & shift & goto ParseArgs
+if /I "%arg%"=="-Help"        goto ShowUsage
+if /I "%arg%"=="/Help"        goto ShowUsage
+if /I "%arg%"=="-h"           goto ShowUsage
+if /I "%arg%"=="/h"           goto ShowUsage
+if /I "%arg%"=="-?"           goto ShowUsage
+if /I "%arg%"=="/?"           goto ShowUsage
 shift
 goto ParseArgs
 
@@ -88,8 +93,8 @@ echo credshunter v%VERSION% - reusable-credential discovery (read-only, CMD)
 echo.
 echo Usage: credshunter.bat -Path ^<dir^> [options]
 echo.
-echo   -Path ^<dir^>          Directories to scan (stages 2-5)
-echo   -ExcludePath ^<dir^>   Directories to skip (stages 2-5)
+echo   -Path ^<dir^>          Directories to scan (stages 2-6)
+echo   -ExcludePath ^<dir^>   Directories to skip (stages 2-6)
 echo   -NoDefaultExclude    Don't skip built-in system/vendor dirs
 echo   -All                 Stage 5 scans every readable file
 echo   -IncludeData         Also scan large SQL/CSV/data files
@@ -97,7 +102,8 @@ echo   -MaxFileSizeMB ^<n^>   Skip files larger than n MB (default 5)
 echo   -NoSizeLimit         Disable the file-size cap
 echo   -OutputFile ^<file^>   Append a findings log
 echo   -SkipSystem          Skip stage 1 (OS checks)
-echo   -NoStage1..5         Skip an individual stage
+echo   -NoStage1..6         Skip an individual stage
+echo   -NoGit               Same as -NoStage6 ^(alias^)
 echo   -Quiet               Reduce status noise
 echo   -NoColor             Strip colour codes
 echo   -Help                Show this help
@@ -109,6 +115,7 @@ goto :EOF
 
 :ArgsDone
 if not defined PATHS goto ShowUsage
+setlocal EnableDelayedExpansion
 
 set "CR="
 set "CG="
@@ -142,6 +149,7 @@ set "HIGH=%TMPDIR%\high.txt"
 set "KEY=%TMPDIR%\key.txt"
 set "INTEREST=%TMPDIR%\interest.txt"
 set "NAME=%TMPDIR%\name.txt"
+set "GIT=%TMPDIR%\git.txt"
 set "CHECKED=%TMPDIR%\checked.txt"
 set "SKIPPED=%TMPDIR%\skipped.txt"
 set "GUAR=%TMPDIR%\guaranteed.txt"
@@ -320,6 +328,7 @@ set /a nHigh=0
 set /a nKey=0
 set /a nInt=0
 set /a nName=0
+set /a nGit=0
 set /a nCheck=0
 set /a nSkip=0
 set /a EXITCODE=0
@@ -376,15 +385,16 @@ if not defined NOSTAGE1 (
 )
 
 if not defined PATHS goto SkipFileStages
-if defined NOSTAGE2 if defined NOSTAGE3 if defined NOSTAGE4 if defined NOSTAGE5 goto SkipFileStages
+if defined NOSTAGE2 if defined NOSTAGE3 if defined NOSTAGE4 if defined NOSTAGE5 if defined NOSTAGE6 goto SkipFileStages
 
+call :BuildExclusions
+
+if defined NOSTAGE2 if defined NOSTAGE3 if defined NOSTAGE4 if defined NOSTAGE5 goto RunStage6
 if not defined QUIET (
     echo.
     echo   !CC!==== STAGE 2-5 -- File scanning ==================================!CNC!
     echo !CB![*] Enumerating files...!CNC!
 )
-
-call :BuildExclusions
 
 echo. > "%FILELIST%"
 for %%P in (%PATHS%) do (
@@ -402,6 +412,14 @@ if not defined NOSTAGE2 call :DoStage2
 if not defined NOSTAGE3 call :DoStage3
 if not defined NOSTAGE4 call :DoStage4
 if not defined NOSTAGE5 call :DoStage5
+
+:RunStage6
+if not defined NOSTAGE6 (
+    call :DoStage6
+) else if not defined QUIET (
+    echo.
+    echo   !CC!==== STAGE 6 -- Git repository discovery [SKIPPED] ==============!CNC!
+)
 
 :SkipFileStages
 call :WriteSummary
@@ -985,6 +1003,113 @@ set /a scanned=0
 for /f "delims=" %%F in ('type "%FILELIST%"') do call :Stage5File "%%~F"
 if not defined QUIET echo !CG![+] Stage 5 complete.!CNC!
 goto :EOF
+
+:DoStage6
+if not defined QUIET (
+    echo.
+    echo   !CC!==== STAGE 6 -- Git repository discovery ========================!CNC!
+)
+type nul > "%GIT%"
+setlocal DisableDelayedExpansion
+set "gitPaths=%PATHS%"
+for %%P in ("%gitPaths:;=" "%") do if not "%%~P"=="" (
+    if exist "%%~fP\" (
+        for %%R in ("%%~fP") do call :GitVisitDirectory "%%~fR" "%%~nxR"
+    ) else if exist "%%~fP" (
+        for %%R in ("%%~fP") do if /I "%%~nxR"==".git" call :GitVisitFile "%%~fR" "%%~dpR"
+    )
+)
+endlocal
+sort /UNIQUE "%GIT%" > "%GIT%.sorted" 2>nul
+move /Y "%GIT%.sorted" "%GIT%" >nul 2>&1
+for /f %%N in ('find /V /C "" ^< "%GIT%"') do set /a nGit=%%N
+if not defined QUIET if !nGit! GTR 0 (
+    setlocal DisableDelayedExpansion
+    for /f "usebackq delims=" %%L in ("%GIT%") do echo   %CB%%%L%CNC%
+    endlocal
+)
+goto :EOF
+
+:GitVisitFile
+setlocal DisableDelayedExpansion
+set "marker=%~1"
+set "repoRoot=%~2"
+for %%A in ("%marker%") do set "markerAttrs=%%~aA"
+if not "%markerAttrs:l=%"=="%markerAttrs%" (endlocal & exit /b 0)
+for %%R in ("%repoRoot%.") do call :GitDirectoryExcluded "%%~fR" "%%~nxR"
+if errorlevel 1 call :CheckGitFile "%marker%" "%repoRoot%"
+endlocal
+exit /b 0
+
+:GitVisitDirectory
+setlocal DisableDelayedExpansion
+set "candidate=%~1"
+set "candidateName=%~2"
+call :GitDirectoryExcluded "%candidate%" "%candidateName%"
+if not errorlevel 1 (endlocal & exit /b 0)
+if /I "%candidateName%"==".git" (
+    for %%R in ("%candidate%\..") do call :RecordGit "directory" "%candidate%" "%%~fR"
+    endlocal & exit /b 0
+)
+call :WalkGitDirectory "%candidate%"
+endlocal
+exit /b 0
+
+:WalkGitDirectory
+setlocal DisableDelayedExpansion
+set "current=%~1"
+if exist "%current%\.git" if not exist "%current%\.git\" call :CheckGitFile "%current%\.git" "%current%"
+for /f "delims=" %%D in ('dir /B /A:D "%current%\*" 2^>nul') do (
+    call :GitVisitDirectory "%current%\%%D" "%%D"
+)
+endlocal
+exit /b 0
+
+:GitDirectoryExcluded
+setlocal DisableDelayedExpansion
+set "candidate=%~1"
+set "candidateName=%~2"
+for %%A in ("%candidate%") do set "candidateAttrs=%%~aA"
+if not "%candidateAttrs:l=%"=="%candidateAttrs%" (endlocal & exit /b 0)
+for %%E in (%EXCL_DIRS%) do if /I "%candidateName%"=="%%~E" (endlocal & exit /b 0)
+for %%X in ("%EXCLUDEPATHS:;=" "%") do if not "%%~X"=="" (
+    set "prefix=%%~fX"
+    setlocal EnableDelayedExpansion
+    >nul echo(!candidate!| findstr /I /B /L /C:"!prefix!" >nul 2>&1
+    for %%# in (!errorlevel!) do endlocal & if "%%#"=="0" (endlocal & exit /b 0)
+)
+for %%X in (%EXCL_PREFIXES%) do (
+    set "prefix=%%~X"
+    setlocal EnableDelayedExpansion
+    >nul echo(!candidate!| findstr /I /B /L /C:"!prefix!" >nul 2>&1
+    for %%# in (!errorlevel!) do endlocal & if "%%#"=="0" (endlocal & exit /b 0)
+)
+endlocal
+exit /b 1
+
+:CheckGitFile
+setlocal DisableDelayedExpansion
+set "marker=%~1"
+set "repoRoot=%~2"
+set "first="
+<"%marker%" set /p "first=" 2>nul
+setlocal EnableDelayedExpansion
+>nul echo(!first!| findstr /I /B /R /C:" *gitdir: *[^ ]" >nul 2>&1
+for %%# in (!errorlevel!) do endlocal & if "%%#"=="0" call :RecordGit "file" "!marker!" "!repoRoot!"
+endlocal
+exit /b 0
+
+:RecordGit
+setlocal DisableDelayedExpansion
+set "gitType=%~1"
+set "gitMarker=%~2"
+set "gitRoot=%~3"
+set "gitLine=[GIT] %gitType%  %gitMarker%  -^>  %gitRoot%"
+setlocal EnableDelayedExpansion
+>>"!GIT!" echo(!gitLine!
+endlocal
+endlocal
+exit /b 0
 
 :Stage5File
 set "fp=%~1"
@@ -1581,6 +1706,19 @@ if %nName% GTR 0 (
         if defined OUTPUTFILE echo %%a >> "%OUTPUTFILE%"
     )
 )
+if %nGit% GTR 0 (
+    if not defined QUIET (
+        echo.
+        echo   !CW!^> Git repositories!CNC!
+    )
+    if defined OUTPUTFILE echo === Git repositories === >> "%OUTPUTFILE%"
+    setlocal DisableDelayedExpansion
+    for /f "usebackq delims=" %%a in ("%GIT%") do (
+        echo   %CB%%%a%CNC%
+        if defined OUTPUTFILE echo %%a >> "%OUTPUTFILE%"
+    )
+    endlocal
+)
 if %nCheck% GTR 0 (
     if not defined QUIET (
         echo.
@@ -1612,6 +1750,7 @@ if not defined QUIET (
     echo   !CM!Private keys / auth material ............... %nKey%!CNC!
     echo   !CC!Auxiliary credential-related files .......... %nInt%!CNC!
     echo   !CY!Suspicious filenames ^(substring^) ............ %nName%!CNC!
+    echo   !CB!Git repositories found ...................... %nGit%!CNC!
     echo   !CB!OS locations checked ........................ %nCheck%!CNC!
     echo   !CD!Files skipped ^(size/binary/perm^) ............ %nSkip%!CNC!
 )
@@ -1623,6 +1762,7 @@ if defined OUTPUTFILE (
     echo   Private keys / material:         %nKey% >> "%OUTPUTFILE%"
     echo   Auxiliary credential-related:    %nInt% >> "%OUTPUTFILE%"
     echo   Suspicious filenames:            %nName% >> "%OUTPUTFILE%"
+    echo   Git repositories found:           %nGit% >> "%OUTPUTFILE%"
     echo   OS locations checked:            %nCheck% >> "%OUTPUTFILE%"
     echo   Files skipped:                   %nSkip% >> "%OUTPUTFILE%"
     if not defined QUIET echo !CB![*] Full log written to !CW!!OUTPUTFILE!!CNC!

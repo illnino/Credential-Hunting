@@ -19,10 +19,10 @@
     Built for authorized internal pentests, red-team engagements, CTFs.
 
 .PARAMETER Path
-    One or more directories to scan recursively (stages 2-5).
+    One or more directories to scan recursively (stages 2-6).
 
 .PARAMETER ExcludePath
-    Directories to skip during stages 2-5. Stage 1 (OS-level credential
+    Directories to skip during stages 2-6. Stage 1 (OS-level credential
     checks) always uses its own hardcoded list and is unaffected.
 
 .PARAMETER All
@@ -55,6 +55,9 @@
 
 .PARAMETER NoStage5
     Skip stage 5 (recursive content scan).
+
+.PARAMETER NoStage6
+    Skip stage 6 (Git repository discovery). Alias: -NoGit.
 
 .PARAMETER Quiet
     Reduce status noise. Findings still printed.
@@ -114,6 +117,8 @@ param(
     [switch] $NoStage3,
     [switch] $NoStage4,
     [switch] $NoStage5,
+    [Alias('NoGit')]
+    [switch] $NoStage6,
 
     [switch] $Quiet,
 
@@ -134,8 +139,8 @@ credshunter v$($script:Version) - reusable-credential discovery (read-only, Wind
 
 Usage: .\credshunter.ps1 -Path <dir>[,<dir>] [options]
 
-  -Path <dir>          Directories to scan (stages 2-5)
-  -ExcludePath <dir>   Directories to skip (stages 2-5)
+  -Path <dir>          Directories to scan (stages 2-6)
+  -ExcludePath <dir>   Directories to skip (stages 2-6)
   -NoDefaultExclude    Don't skip built-in system / vendor dirs
   -All                 Stage 5 scans every readable file
   -IncludeData         Also scan large SQL / CSV / data files
@@ -143,7 +148,8 @@ Usage: .\credshunter.ps1 -Path <dir>[,<dir>] [options]
   -NoSizeLimit         Disable the file-size cap
   -OutputFile <file>   Append a findings log
   -SkipSystem          Skip stage 1 (OS checks); alias -NoStage1
-  -NoStage1..5         Skip an individual stage
+  -NoStage1..6         Skip an individual stage
+  -NoGit               Same as -NoStage6 (alias)
   -Quiet               Reduce status noise
   -NoColor             Strip colour codes
   -Help                Show this help (-h)
@@ -168,6 +174,7 @@ $script:Stage2Skip = $NoStage2.IsPresent
 $script:Stage3Skip = $NoStage3.IsPresent
 $script:Stage4Skip = $NoStage4.IsPresent
 $script:Stage5Skip = $NoStage5.IsPresent
+$script:Stage6Skip = $NoStage6.IsPresent
 
 # Resolve our own path so we never scan ourselves
 $script:SelfPath = $null
@@ -272,6 +279,9 @@ $script:Guaranteed       = [System.Collections.Generic.List[object]]::new()
 $script:GuaranteedHashes = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 $script:SuspiciousNamesFound = [System.Collections.Generic.List[string]]::new()
 $script:NameHashes       = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+$script:GitRepositories  = [System.Collections.Generic.List[object]]::new()
+$script:GitHashes        = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+$script:GitMarkerCandidates = [System.Collections.Generic.List[object]]::new()
 $script:LocationsChecked = [System.Collections.Generic.List[object]]::new()
 $script:CheckedHashes    = [System.Collections.Generic.HashSet[string]]::new()
 $script:SkippedFiles     = [System.Collections.Generic.List[object]]::new()
@@ -954,7 +964,7 @@ $script:ExcludeDirNames = @(
 $script:ExcludeDirSet = [System.Collections.Generic.HashSet[string]]::new(
     [string[]]$script:ExcludeDirNames, [System.StringComparer]::OrdinalIgnoreCase)
 
-# Absolute-path prefixes never to descend into during stages 2-5.
+# Absolute-path prefixes never to descend into during stages 2-6.
 #
 # IMPORTANT: Stage 1 (OS-level checks) uses hardcoded paths and bypasses
 # this list -- excluding $env:SystemRoot does NOT prevent Sysprep / GPP /
@@ -1225,6 +1235,7 @@ function Begin-Stage { param([int]$N)
         Key        = $script:KeyFindings.Count
         Interest   = $script:Interesting.Count
         Name       = $script:SuspiciousNamesFound.Count
+        Git        = $script:GitRepositories.Count
     }
     $script:StageStartTime[$N] = [DateTime]::UtcNow
 }
@@ -1237,7 +1248,8 @@ function End-Stage { param([int]$N, [string]$Title)
     $dKey  = $script:KeyFindings.Count          - $before.Key
     $dInt  = $script:Interesting.Count          - $before.Interest
     $dName = $script:SuspiciousNamesFound.Count - $before.Name
-    $total = $dGuar + $dHigh + $dKey + $dInt + $dName
+    $dGit  = $script:GitRepositories.Count      - $before.Git
+    $total = $dGuar + $dHigh + $dKey + $dInt + $dName + $dGit
 
     $header = "Stage $N -- $Title"
     $tw = 72
@@ -1276,6 +1288,11 @@ function End-Stage { param([int]$N, [string]$Title)
         if ($dName -gt 0) {
             $script:SuspiciousNamesFound | Select-Object -Last $dName | ForEach-Object {
                 Write-Host ("  [{0,-8}]  {1}" -f 'NAME', $_)
+            }
+        }
+        if ($dGit -gt 0) {
+            $script:GitRepositories | Select-Object -Last $dGit | ForEach-Object {
+                Write-Host ("  [{0,-8}]  {1,-9}  {2}  {3}  {4}" -f 'GIT', $_.MarkerType, $_.MarkerPath, $script:GArrow, $_.RepositoryRoot)
             }
         }
     }
@@ -1473,6 +1490,16 @@ function Add-SuspiciousName { param([string]$Path)
         if ($script:InStage1) {
             Write-Stage1Finding -Tier 'Name' -Label 'name_match' -Path $Path
         }
+    }
+}
+function Add-GitRepository {
+    param([string]$MarkerType, [string]$MarkerPath, [string]$RepositoryRoot)
+    if ($script:GitHashes.Add($MarkerPath)) {
+        $script:GitRepositories.Add([PSCustomObject]@{
+            MarkerType = $MarkerType
+            MarkerPath = $MarkerPath
+            RepositoryRoot = $RepositoryRoot
+        }) | Out-Null
     }
 }
 function Add-Checked { param([string]$Label, [string]$Path)
@@ -2573,10 +2600,10 @@ function Invoke-SystemChecks {
 }
 
 # ============================================================================
-#  Recursive scanning of user-supplied paths (stages 2-5)
+#  Recursive scanning of user-supplied paths (stages 2-6)
 # ============================================================================
 
-# Single shared tree walk for stages 2-5, with the directory-exclusion check applied.
+# Single shared tree walk for stages 2-6, with the directory-exclusion check applied.
 function Get-WalkedFiles { param([string[]]$Paths)
     # Walk each -Path subtree ONCE (reparse-guarded, Test-DirectoryExcluded
     # applied) and return a List of file descriptors { Path, Name (lc), Ext (lc),
@@ -2603,7 +2630,26 @@ function Get-WalkedFiles { param([string[]]$Paths)
                 $result.Add([PSCustomObject]@{
                     Path = $fi.FullName; Name = $fi.Name.ToLowerInvariant()
                     Ext  = $fi.Extension.ToLowerInvariant(); Size = $fi.Length })
-            } catch {}
+                if (-not $script:Stage6Skip -and
+                    $fi.Name.Equals('.git', [System.StringComparison]::OrdinalIgnoreCase) -and
+                    (($fi.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq 0)) {
+                    $parentExcluded = Test-DirectoryExcluded -DirectoryPath $fi.DirectoryName
+                    if (-not $parentExcluded) {
+                        $script:GitMarkerCandidates.Add([PSCustomObject]@{
+                            MarkerType = 'file'; MarkerPath = $fi.FullName
+                            RepositoryRoot = $fi.DirectoryName }) | Out-Null
+                    }
+                }
+            } catch { Add-Skipped -Path $abs -Reason ('stat error: ' + $_.Exception.Message) }
+            continue
+        }
+        if ($it.Name.Equals('.git', [System.StringComparison]::OrdinalIgnoreCase)) {
+            $gitExcluded = Test-DirectoryExcluded -DirectoryPath $it.FullName -KnownAttributes $it.Attributes
+            if (-not $gitExcluded -and -not $script:Stage6Skip) {
+                $script:GitMarkerCandidates.Add([PSCustomObject]@{
+                    MarkerType = 'directory'; MarkerPath = $it.FullName
+                    RepositoryRoot = $it.Parent.FullName }) | Out-Null
+            }
             continue
         }
         $stack.Push($abs)
@@ -2614,6 +2660,17 @@ function Get-WalkedFiles { param([string[]]$Paths)
         try {
             foreach ($info in (New-Object System.IO.DirectoryInfo $current).EnumerateFileSystemInfos()) {
                 if ($info -is [System.IO.DirectoryInfo]) {
+                    # Observe a .git directory before the normal exclusion check, then
+                    # prune it so stages 2-5 never walk objects, packs, logs, or refs.
+                    if ($info.Name.Equals('.git', [System.StringComparison]::OrdinalIgnoreCase)) {
+                        $gitExcluded = Test-DirectoryExcluded -DirectoryPath $info.FullName -KnownAttributes $info.Attributes
+                        if (-not $gitExcluded -and -not $script:Stage6Skip) {
+                            $script:GitMarkerCandidates.Add([PSCustomObject]@{
+                                MarkerType = 'directory'; MarkerPath = $info.FullName
+                                RepositoryRoot = $info.Parent.FullName }) | Out-Null
+                        }
+                        continue
+                    }
                     # Attributes are already populated from the enumeration's find-data;
                     # pass them so Test-DirectoryExcluded does not re-stat the directory.
                     if (-not (Test-DirectoryExcluded -DirectoryPath $info.FullName -KnownAttributes $info.Attributes)) { $stack.Push($info.FullName) }
@@ -2621,13 +2678,22 @@ function Get-WalkedFiles { param([string[]]$Paths)
                     $result.Add([PSCustomObject]@{
                         Path = $info.FullName; Name = $info.Name.ToLowerInvariant()
                         Ext  = $info.Extension.ToLowerInvariant(); Size = $info.Length })
+                    if (-not $script:Stage6Skip -and
+                        $info.Name.Equals('.git', [System.StringComparison]::OrdinalIgnoreCase) -and
+                        (($info.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq 0)) {
+                        $script:GitMarkerCandidates.Add([PSCustomObject]@{
+                            MarkerType = 'file'; MarkerPath = $info.FullName
+                            RepositoryRoot = $info.Directory.FullName }) | Out-Null
+                    }
                     $walkCount++
                     if (-not $Quiet -and ($walkCount % 20000) -eq 0) {
                         Write-Host ("  $($script:CD)[*] enumerated $walkCount files...$($script:CNC)")
                     }
                 }
             }
-        } catch {}
+        } catch {
+            Add-Skipped -Path $current -Reason ('directory enumeration error: ' + $_.Exception.Message)
+        }
     }
     return ,$result
 }
@@ -2777,6 +2843,28 @@ function Invoke-UserPathScan { param($Files)
 }
 
 # ============================================================================
+#  Stage 6 - Git repository discovery
+# ============================================================================
+
+function Find-GitRepositories { param($Markers)
+    foreach ($marker in $Markers) {
+        if ($marker.MarkerType -eq 'directory') {
+            Add-GitRepository -MarkerType 'directory' -MarkerPath $marker.MarkerPath -RepositoryRoot $marker.RepositoryRoot
+            continue
+        }
+        try {
+            $reader = New-Object System.IO.StreamReader($marker.MarkerPath, $true)
+            try { $first = $reader.ReadLine() } finally { $reader.Dispose() }
+            if ($null -ne $first -and $first -match '^\s*gitdir:\s*\S') {
+                Add-GitRepository -MarkerType 'file' -MarkerPath $marker.MarkerPath -RepositoryRoot $marker.RepositoryRoot
+            }
+        } catch {
+            Add-Skipped -Path $marker.MarkerPath -Reason ('Git marker read error: ' + $_.Exception.Message)
+        }
+    }
+}
+
+# ============================================================================
 #  Output / summary
 # ============================================================================
 
@@ -2848,6 +2936,19 @@ function Write-FullSummary {
     } catch { Write-Warn ("summary section error (Suspicious filenames): " + $_.Exception.Message) }
 
     try {
+    if ($script:GitRepositories.Count -gt 0) {
+        Write-Host ""
+        Write-Host "$($script:CBold)$($script:CW)$($script:GBul) Git repositories$($script:CNC)"
+        Write-LogLine ""
+        Write-LogLine "=== Git repositories ==="
+        foreach ($g in $script:GitRepositories | Sort-Object MarkerPath -Unique) {
+            Write-Host ("  $($script:CB)[GIT]$($script:CNC) {0,-9}  {1}  {2}  {3}" -f $g.MarkerType, $g.MarkerPath, $script:GArrow, $g.RepositoryRoot)
+            Write-LogLine ("[GIT] {0}  {1}  {2}  {3}" -f $g.MarkerType, $g.MarkerPath, $script:GArrow, $g.RepositoryRoot)
+        }
+    }
+    } catch { Write-Warn ("summary section error (Git repositories): " + $_.Exception.Message) }
+
+    try {
     if ($script:LocationsChecked.Count -gt 0) {
         Write-Host ""
         Write-Host "$($script:CBold)$($script:CW)$($script:GBul) OS locations checked$($script:CNC)"
@@ -2880,6 +2981,7 @@ function Write-FullSummary {
     $nKey   = $script:KeyFindings.Count
     $nInt   = $script:Interesting.Count
     $nName  = $script:SuspiciousNamesFound.Count
+    $nGit   = $script:GitRepositories.Count
     $nCheck = $script:LocationsChecked.Count
     $nSkip  = $script:SkippedFiles.Count
     Write-SummaryRow ($script:CBold + $script:CR) ("Confirmed credential containers " + $script:GWarn) $nGuar
@@ -2887,6 +2989,7 @@ function Write-FullSummary {
     Write-SummaryRow $script:CM "Private keys / auth material"        $nKey
     Write-SummaryRow $script:CC "Auxiliary credential-related files"  $nInt
     Write-SummaryRow $script:CY "Suspicious filenames (substring)"    $nName
+    Write-SummaryRow $script:CB "Git repositories found"                $nGit
     Write-SummaryRow $script:CB "OS locations checked"                $nCheck
     Write-SummaryRow $script:CD "Files skipped (size/binary/perm)"    $nSkip
 
@@ -2897,6 +3000,7 @@ function Write-FullSummary {
     Write-LogLine "  Private keys / material:         $nKey"
     Write-LogLine "  Auxiliary credential-related:    $nInt"
     Write-LogLine "  Suspicious filenames (substring):$nName"
+    Write-LogLine "  Git repositories found:           $nGit"
     Write-LogLine "  OS locations checked:            $nCheck"
     Write-LogLine "  Files skipped:                   $nSkip"
     } catch { Write-Warn ("summary section error (Summary table): " + $_.Exception.Message) }
@@ -2945,7 +3049,7 @@ function Invoke-Main {
     }
 
     if ($script:UserExcludePaths.Count -gt 0) {
-        Write-Info ("User exclusions ($($script:CW){0}$($script:CNC)) - applied to stages 2-5 only:" -f $script:UserExcludePaths.Count)
+        Write-Info ("User exclusions ($($script:CW){0}$($script:CNC)) - applied to stages 2-6 only:" -f $script:UserExcludePaths.Count)
         foreach ($p in $script:UserExcludePaths) {
             Write-Host ("       $($script:CD)- {0}$($script:CNC)" -f $p)
         }
@@ -2973,14 +3077,14 @@ function Invoke-Main {
     }
 
     if ($Path.Count -eq 0) {
-        Write-Warn "No -Path supplied. Skipping stages 2-5."
+        Write-Warn "No -Path supplied. Skipping stages 2-6."
         Write-Warn "Tip: pass -Path C:\ to scan everywhere."
     } else {
-        # Walk the -Path tree ONCE and share the file list across stages 2-5
+        # Walk the -Path tree ONCE and share the inventory across stages 2-6
         # (unless every one of them is skipped). Each stage keeps its own
         # predicate; only the enumeration is de-duplicated.
         $walked = $null
-        if (-not ($script:Stage2Skip -and $script:Stage3Skip -and $script:Stage4Skip -and $script:Stage5Skip)) {
+        if (-not ($script:Stage2Skip -and $script:Stage3Skip -and $script:Stage4Skip -and $script:Stage5Skip -and $script:Stage6Skip)) {
             $walked = Get-WalkedFiles -Paths $Path
         }
         if (-not $script:Stage2Skip) {
@@ -3002,6 +3106,11 @@ function Invoke-Main {
             Begin-Stage 5; Invoke-UserPathScan -Files $walked; End-Stage 5 "Recursive content scan"
         } else {
             Stage-Skipped 5 "Recursive content scan"
+        }
+        if (-not $script:Stage6Skip) {
+            Begin-Stage 6; Find-GitRepositories -Markers $script:GitMarkerCandidates; End-Stage 6 "Git repository discovery"
+        } else {
+            Stage-Skipped 6 "Git repository discovery"
         }
     }
     } finally {
