@@ -10,7 +10,7 @@
 
 ![read-only](https://img.shields.io/badge/read--only-yes-3fb950?style=flat-square)
 ![no network](https://img.shields.io/badge/network-none-3fb950?style=flat-square)
-![version](https://img.shields.io/badge/version-2.4.0-2dd4bf?style=flat-square)
+![version](https://img.shields.io/badge/version-2.5.0-2dd4bf?style=flat-square)
 ![bash](https://img.shields.io/badge/bash-4%2B-2b3137?style=flat-square&logo=gnubash&logoColor=white)
 ![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B-2b3137?style=flat-square&logo=powershell&logoColor=white)
 ![authorized use only](https://img.shields.io/badge/use-authorized%20only-f85149?style=flat-square)
@@ -41,7 +41,7 @@ The project deliberately **does not target cloud / SaaS access tokens** such as 
 
 ## How it works
 
-CredsHunter uses a five-stage funnel that narrows from known credential locations to recursive content inspection.
+CredsHunter uses a seven-stage workflow covering known credential locations, recursive file inspection, Git repositories, and the scanner process environment.
 
 | Stage | Focus | Examples |
 |:--:|---|---|
@@ -50,8 +50,10 @@ CredsHunter uses a five-stage funnel that narrows from known credential location
 | **3** | High-value file types | Private keys, `.env`, backups, databases, captures, archives, configuration files |
 | **4** | Suspicious filenames | `*password*`, `*secret*`, `*credential*`, `*login*`, `*account*` |
 | **5** | Content scan | 70+ tuned credential regexes with false-positive filtering |
+| **6** | Git repository discovery | `.git` directories and valid `.git` indirection files |
+| **7** | Process environment | Inherited `NAME=VALUE` assignments matched by the existing credential rules |
 
-Stages **1** and **5** perform the deepest inspection. Stages **2–4** are intentionally fast filename and extension passes.
+Stages **1**, **5**, and **7** perform credential-content inspection. Stages **2–4** are intentionally fast filename and extension passes, while Stage **6** identifies repository roots without scanning Git internals.
 
 Each finding is filtered before it reaches the final results, and findings are surfaced as the scan progresses rather than being hidden until the end.
 
@@ -110,6 +112,12 @@ Exclude a directory tree:
 ./credshunter.sh -p / -x /var/lib/customer-app
 ```
 
+Scan only the inherited process environment:
+
+```bash
+./credshunter.sh --no-stage1 --no-stage2 --no-stage3 --no-stage4 --no-stage5 --no-stage6
+```
+
 ### Windows
 
 Full `C:\` sweep:
@@ -135,6 +143,20 @@ Disable built-in system / vendor exclusions:
 ```powershell
 .\credshunter.ps1 -Path C:\ -NoDefaultExclude
 ```
+
+Scan only the inherited process environment:
+
+```powershell
+.\credshunter.ps1 -NoStage1 -NoStage2 -NoStage3 -NoStage4 -NoStage5 -NoStage6
+```
+
+The CMD-only port supports the same pathless Stage 7 workflow:
+
+```bat
+credshunter.bat -NoStage1 -NoStage2 -NoStage3 -NoStage4 -NoStage5 -NoStage6
+```
+
+> **Plaintext warning:** Stage 7 displays the complete matched `NAME=VALUE` assignment. If output logging is enabled, it writes that assignment to the log as well. Protect console captures and log files as credential material. Assignments larger than 16 KiB are skipped with a name-only warning.
 
 CredsHunter is pipe-friendly. Use `--no-color` on Linux or `-NoColor` on Windows when redirecting or filtering output.
 
@@ -173,13 +195,17 @@ For example:
 | Disable size cap | `--no-size-limit` | `-NoSizeLimit` |
 | Write findings to file | `-o FILE` / `--output FILE` | `-OutputFile FILE` |
 | Skip OS-level checks | `-s` / `--skip-system` / `--no-stage1` | `-SkipSystem` / `-NoStage1` |
-| Skip a stage | `--no-stage2` ... `--no-stage5` | `-NoStage2` ... `-NoStage5` |
+| Skip a stage | `--no-stage2` ... `--no-stage7` | `-NoStage2` ... `-NoStage7` |
+| Skip Git discovery | `--no-stage6` / `--no-git` | `-NoStage6` / `-NoGit` |
+| Skip process environment discovery | `--no-stage7` / `--no-env` | `-NoStage7` / `-NoEnv` |
 | Reduce status output | `-q` / `--quiet` | `-Quiet` |
 | Disable ANSI colors | `--no-color` | `-NoColor` |
 | Include SQL / CSV-style data files | — | `-IncludeData` |
 | Disable default vendor/system exclusions | — | `-NoDefaultExclude` |
 
 The default maximum file size is **5 MB**. Increase it when credentials may live in larger logs, dumps, or configuration exports, or disable the cap when appropriate.
+
+The summary row `Environment credential findings` counts unique matched environment variable names. It is a subset of the existing `HIGH`/`KEY` totals and is not added to them again.
 
 ---
 
