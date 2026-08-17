@@ -119,6 +119,8 @@ param(
     [switch] $NoStage5,
     [Alias('NoGit')]
     [switch] $NoStage6,
+    [Alias('NoEnv')]
+    [switch] $NoStage7,
 
     [switch] $Quiet,
 
@@ -128,16 +130,15 @@ param(
     [switch] $Help
 )
 
-$script:Version = '2.4.0'
+$script:Version = '2.5.0'
 
-# Minimalistic, Linux-style usage. Shown for -Help / -h and when the script is
-# run with no parameters at all. (Get-Help .\credshunter.ps1 still gives the full
-# comment-based reference.)
+# Minimalistic, Linux-style usage for -Help / -h. A no-argument run now remains
+# valid because Stages 1 and 7 do not require a filesystem path.
 function Show-Usage {
     @"
 credshunter v$($script:Version) - reusable-credential discovery (read-only, Windows)
 
-Usage: .\credshunter.ps1 -Path <dir>[,<dir>] [options]
+Usage: .\credshunter.ps1 [-Path <dir>[,<dir>]] [options]
 
   -Path <dir>          Directories to scan (stages 2-6)
   -ExcludePath <dir>   Directories to skip (stages 2-6)
@@ -148,8 +149,9 @@ Usage: .\credshunter.ps1 -Path <dir>[,<dir>] [options]
   -NoSizeLimit         Disable the file-size cap
   -OutputFile <file>   Append a findings log
   -SkipSystem          Skip stage 1 (OS checks); alias -NoStage1
-  -NoStage1..6         Skip an individual stage
+  -NoStage1..7         Skip an individual stage
   -NoGit               Same as -NoStage6 (alias)
+  -NoEnv               Same as -NoStage7 (alias)
   -Quiet               Reduce status noise
   -NoColor             Strip colour codes
   -Help                Show this help (-h)
@@ -157,13 +159,25 @@ Usage: .\credshunter.ps1 -Path <dir>[,<dir>] [options]
 Examples:
   .\credshunter.ps1 -Path C:\ -OutputFile loot.txt
   .\credshunter.ps1 -Path C:\Users,C:\inetpub -SkipSystem
+  .\credshunter.ps1 -NoStage1 -NoStage2 -NoStage3 -NoStage4 -NoStage5 -NoStage6
+
+Warning: Stage 7 prints matched NAME=VALUE assignments in plaintext. When
+-OutputFile is used, those assignments are also written to the findings log.
 "@
 }
 
-if ($Help -or $PSBoundParameters.Count -eq 0) {
+if ($Help) {
     Show-Usage
     exit 0
 }
+
+# Capture immutable name/value records before scanner configuration can change
+# the process environment. PowerShell variables created below are not included.
+$script:StartupEnvironment = @(
+    Get-ChildItem Env: | ForEach-Object {
+        [PSCustomObject]@{ Name = [string]$_.Name; Value = [string]$_.Value }
+    }
+)
 
 $ErrorActionPreference = 'SilentlyContinue'
 $ProgressPreference    = 'Continue'
@@ -175,6 +189,7 @@ $script:Stage3Skip = $NoStage3.IsPresent
 $script:Stage4Skip = $NoStage4.IsPresent
 $script:Stage5Skip = $NoStage5.IsPresent
 $script:Stage6Skip = $NoStage6.IsPresent
+$script:Stage7Skip = $NoStage7.IsPresent
 
 # Resolve our own path so we never scan ourselves
 $script:SelfPath = $null
@@ -282,6 +297,7 @@ $script:NameHashes       = [System.Collections.Generic.HashSet[string]]::new([Sy
 $script:GitRepositories  = [System.Collections.Generic.List[object]]::new()
 $script:GitHashes        = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 $script:GitMarkerCandidates = [System.Collections.Generic.List[object]]::new()
+$script:EnvironmentFindingNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 $script:LocationsChecked = [System.Collections.Generic.List[object]]::new()
 $script:CheckedHashes    = [System.Collections.Generic.HashSet[string]]::new()
 $script:SkippedFiles     = [System.Collections.Generic.List[object]]::new()
@@ -1424,6 +1440,15 @@ function Format-Preview { param([string]$Text)
     return $t.Trim()
 }
 
+function Format-EnvironmentPreview { param([string]$Text)
+    if ($null -eq $Text) { return '' }
+    # Keep the complete assignment while making embedded structure visible and
+    # stripping terminal control bytes.
+    $t = $Text
+    $t = $t.Replace("`r", '\r').Replace("`n", '\n').Replace("`t", '\t')
+    return ($t -replace '[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '')
+}
+
 # Cap a preview for the LIVE feed only (never the Findings section / log). Real
 # credentials are far shorter than the cap, so this only trims pathological
 # multi-KB lines; the complete value still appears in the Findings section.
@@ -1757,6 +1782,102 @@ function Invoke-ScanFile { param([string]$FullPath, [string]$SourceLabel = 'cont
         }
         }
     } finally { $reader.Dispose() }
+}
+
+# Classify one logical NAME=VALUE assignment with the same compiled patterns,
+# first-match rule, value extraction, and false-positive policy as file lines.
+function Test-ProcessEnvironmentAssignment {
+    param([string]$Name, [string]$Value)
+
+    # PWD/OLDPWD are shell location metadata, not password variables. Their
+    # names collide with the generic pwd assignment rule on Unix hosts.
+    if ($Name -eq 'PWD' -or $Name -eq 'OLDPWD') { return $false }
+
+    $assignment = '{0}={1}' -f $Name, $Value
+    $safeName = Format-Preview $Name
+    if ($assignment.Length -gt $script:MaxLineLen) {
+        Write-Warn ("Skipping oversized environment variable: ENV:{0} (>16 KiB)" -f $safeName)
+        return $false
+    }
+
+    $location = 'ENV:' + $Name
+    $preview = Format-EnvironmentPreview $assignment
+    $matched = $false
+
+    if ($assignment.IndexOf('-----BEGIN', [System.StringComparison]::Ordinal) -ge 0 -or
+        $assignment.IndexOf('PuTTY-User-Key-File', [System.StringComparison]::Ordinal) -ge 0) {
+        foreach ($p in $script:KeyPatterns) {
+            if ($p.Regex.IsMatch($assignment)) {
+                Add-Finding -Bucket Key -Label ("process_env/" + $p.Label) `
+                    -Path $location -LineNumber 0 -Preview $preview
+                $matched = $true
+                break
+            }
+        }
+    }
+
+    if (-not $script:KeywordPrefilter.IsMatch($assignment)) { return $matched }
+
+    foreach ($p in $script:CredPatterns) {
+        $m = $p.Regex.Match($assignment)
+        if (-not $m.Success) { continue }
+
+        if ($assignment -match '^\s*(#|//|;|[Rr][Ee][Mm]\s)' -and
+            $p.Label -match '(_cmd$|_pass$|^cmdline_pw_flag$|^impacket_cred$|^runas_savecred$|^cmdkey_add$|^net_user_create$|^chpasswd_|^passwd_stdin$|^ps_localuser|^ps_ad_password$|^ps_secstring|^htpasswd_create$|^nmcli_wifi$|^useradd_pass$|^snmp_community$|^snmp_com2sec$)') {
+            break
+        }
+
+        $candidate = $assignment
+        $kwMatch = [regex]::Match($assignment,
+            '(?i)(?<![A-Za-z])(?:cpassword|passphrase|password|passwd|requirepass|rootpw|credentials?|cred|secret|pass|pwd)(?![A-Za-z0-9])["'']?\s*[:=]?\s*',
+            [System.Text.RegularExpressions.RegexOptions]::None)
+        if ($kwMatch.Success) {
+            $candidate = $assignment.Substring($kwMatch.Index + $kwMatch.Length).Trim()
+            if ($candidate.Length -gt 1 -and ($candidate[0] -eq '"' -or $candidate[0] -eq "'")) {
+                $q = $candidate[0]
+                $close = $candidate.IndexOf($q, 1)
+                if ($close -gt 1) { $candidate = $candidate.Substring(1, $close - 1) }
+            }
+            $candidate = $candidate.Trim().Trim('"', "'", ' ', ';', ',')
+            $candidate = ($candidate -split '[#;]')[0]
+            $candidate = ($candidate -split ',\s+|\s+->\s+|\s+message\s*=', 2)[0]
+        }
+
+        if ($p.Label -eq 'php_array_password' -and $m.Groups.Count -ge 4) {
+            $candidate = $m.Groups[3].Value
+        }
+        if ($p.Label -eq 'drupal_password' -or $p.Label -eq 'wp_db_password' -or
+            $p.Label -eq 'joomla_password' -or $p.Label -eq 'define_secret' -or
+            $p.Label -eq 'php_db_connect' -or $p.Label -eq 'autologon_password') {
+            $mq = [regex]::Match($assignment, '["'']([^"'']+)["''][^"'']*$')
+            if ($mq.Success) { $candidate = $mq.Groups[1].Value }
+        }
+
+        if ($assignment -match '@password\s*=\s*(@password|N''''|NULL|@\w+\b)') { break }
+        if ($assignment -match 'WITH\s+PASSWORD\s*=\s*''Yukon90_''')           { break }
+        if ($assignment -match 'PASSWORD\s*=\s*''\*+''')                       { break }
+        if ($assignment -match 'SQLTelemetry\s*:\s*Setting')                   { break }
+        if ($assignment -match 'SafeSqlCommand.*PASSWORD\s*=\s*''\*+''')       { break }
+
+        if (-not ($script:NoFPCheck -contains $p.Label)) {
+            if (Test-FalsePositive -Value $candidate) { break }
+        }
+
+        Add-Finding -Bucket High -Label ("process_env/" + $p.Label) `
+            -Path $location -LineNumber 0 -Preview $preview
+        $matched = $true
+        break
+    }
+
+    return $matched
+}
+
+function Find-ProcessEnvironmentCredentials {
+    foreach ($entry in $script:StartupEnvironment) {
+        if (Test-ProcessEnvironmentAssignment -Name $entry.Name -Value $entry.Value) {
+            [void]$script:EnvironmentFindingNames.Add($entry.Name)
+        }
+    }
 }
 
 function Test-KnownFile { param([string]$Path, [string]$Label)
@@ -2882,9 +3003,10 @@ function Write-FindingsSection {
     Write-LogLine ""
     Write-LogLine "=== $Title ==="
     foreach ($f in $List | Sort-Object Label, Path, LineNumber) {
-        Write-Host ("  $Color[$Tag]$($script:CNC) $($script:CD)$($f.Label)$($script:CNC)  $($script:CY)$($f.Path):$($f.LineNumber)$($script:CNC)")
+        $location = if ($f.LineNumber -gt 0) { "$($f.Path):$($f.LineNumber)" } else { [string]$f.Path }
+        Write-Host ("  $Color[$Tag]$($script:CNC) $($script:CD)$($f.Label)$($script:CNC)  $($script:CY)$location$($script:CNC)")
         Write-Host ("       $($script:CD)$($f.Preview)$($script:CNC)")
-        Write-LogLine ("[$Tag] $($f.Label) $($f.Path):$($f.LineNumber)  $($f.Preview)")
+        Write-LogLine ("[$Tag] $($f.Label) $location  $($f.Preview)")
     }
 }
 
@@ -2982,6 +3104,7 @@ function Write-FullSummary {
     $nInt   = $script:Interesting.Count
     $nName  = $script:SuspiciousNamesFound.Count
     $nGit   = $script:GitRepositories.Count
+    $nEnv   = $script:EnvironmentFindingNames.Count
     $nCheck = $script:LocationsChecked.Count
     $nSkip  = $script:SkippedFiles.Count
     Write-SummaryRow ($script:CBold + $script:CR) ("Confirmed credential containers " + $script:GWarn) $nGuar
@@ -2990,6 +3113,7 @@ function Write-FullSummary {
     Write-SummaryRow $script:CC "Auxiliary credential-related files"  $nInt
     Write-SummaryRow $script:CY "Suspicious filenames (substring)"    $nName
     Write-SummaryRow $script:CB "Git repositories found"                $nGit
+    Write-SummaryRow $script:CR "Environment credential findings"       $nEnv
     Write-SummaryRow $script:CB "OS locations checked"                $nCheck
     Write-SummaryRow $script:CD "Files skipped (size/binary/perm)"    $nSkip
 
@@ -3001,6 +3125,7 @@ function Write-FullSummary {
     Write-LogLine "  Auxiliary credential-related:    $nInt"
     Write-LogLine "  Suspicious filenames (substring):$nName"
     Write-LogLine "  Git repositories found:           $nGit"
+    Write-LogLine "  Environment credential findings:  $nEnv"
     Write-LogLine "  OS locations checked:            $nCheck"
     Write-LogLine "  Files skipped:                   $nSkip"
     } catch { Write-Warn ("summary section error (Summary table): " + $_.Exception.Message) }
@@ -3078,7 +3203,7 @@ function Invoke-Main {
 
     if ($Path.Count -eq 0) {
         Write-Warn "No -Path supplied. Skipping stages 2-6."
-        Write-Warn "Tip: pass -Path C:\ to scan everywhere."
+        Write-Warn "Tip: pass -Path C:\ to scan files as well as the process environment."
     } else {
         # Walk the -Path tree ONCE and share the inventory across stages 2-6
         # (unless every one of them is skipped). Each stage keeps its own
@@ -3112,6 +3237,14 @@ function Invoke-Main {
         } else {
             Stage-Skipped 6 "Git repository discovery"
         }
+    }
+
+    if (-not $script:Stage7Skip) {
+        Begin-Stage 7
+        Find-ProcessEnvironmentCredentials
+        End-Stage 7 "Process environment credential discovery"
+    } else {
+        Stage-Skipped 7 "Process environment credential discovery"
     }
     } finally {
         Write-FullSummary
