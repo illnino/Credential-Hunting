@@ -20,6 +20,28 @@
 # ============================================================================
 
 set -uo pipefail
+
+# Snapshot the inherited process environment before this script exports or
+# changes any variables. Environment values cannot contain NUL bytes, so a
+# Bash array preserves every value (including embedded newlines) when env(1)
+# supports NUL-delimited output.
+STARTUP_ENV=()
+STARTUP_ENV_MODE='lines'
+capture_startup_environment() {
+    local item
+    if env -0 </dev/null >/dev/null 2>&1; then
+        STARTUP_ENV_MODE='nul'
+        while IFS= read -r -d '' item; do
+            STARTUP_ENV+=("$item")
+        done < <(env -0)
+    else
+        while IFS= read -r item || [ -n "$item" ]; do
+            STARTUP_ENV+=("$item")
+        done < <(env)
+    fi
+}
+capture_startup_environment
+
 # Capture the user's real locale for glyph selection BEFORE forcing LC_ALL=C
 # below -- the C override is for deterministic regex/sort only and must not
 # downgrade the UI to ASCII on a UTF-8 terminal.
@@ -31,7 +53,7 @@ export LC_ALL=C   # consistent regex / sort behavior regardless of host locale
 # miss content like "Password=..." even though grep -i finds it.
 shopt -s nocasematch 2>/dev/null || true
 
-VERSION="2.4.0"
+VERSION="2.5.0"
 
 # Pre-initialise color vars so `err()` and friends work BEFORE setup_colors
 # runs (e.g. when parse_args reports a bad flag).
@@ -57,6 +79,7 @@ STAGE3_SKIP=0
 STAGE4_SKIP=0
 STAGE5_SKIP=0
 STAGE6_SKIP=0
+STAGE7_SKIP=0
 NO_COLOR_FLAG=0
 SCAN_PATHS=()
 USER_EXCLUDE_PATHS=()
@@ -99,9 +122,10 @@ GUARANTEED_FILE="$TMPDIR/guaranteed.tsv"
 SKIPPED_FILE="$TMPDIR/skipped.tsv"
 CHECKED_FILE="$TMPDIR/checked.tsv"
 CANDIDATE_FILES="$TMPDIR/candidates.lst"
+ENV_FINDINGS_FILE="$TMPDIR/environment-findings.lst"
 touch "$HIGH_FILE" "$KEY_FILE" "$NAME_FILE" "$GIT_FILE" \
       "$INTEREST_FILE" "$GUARANTEED_FILE" "$SKIPPED_FILE" \
-      "$CHECKED_FILE" "$CANDIDATE_FILES"
+      "$CHECKED_FILE" "$CANDIDATE_FILES" "$ENV_FINDINGS_FILE"
 
 declare -A SCANNED_PATHS   # canonical path -> 1, dedup across all stages
 declare -A GIT_MARKERS     # canonical .git marker path -> 1
@@ -247,7 +271,7 @@ print_banner() {
 
 usage() {
     cat <<'EOF'
-Usage: credshunter.sh [OPTIONS] -p PATH [-p PATH ...]
+Usage: credshunter.sh [OPTIONS] [-p PATH ...]
 
 Hunt for reusable credentials a pentester can actually leverage (plaintext
 passwords, DB connection strings, private keys, GPP cpassword, NTLM/Kerberos
@@ -274,6 +298,8 @@ Options:
       --no-stage5       Skip stage 5 (recursive content scan).
       --no-stage6       Skip stage 6 (Git repository discovery).
       --no-git          Same as --no-stage6 (alias).
+      --no-stage7       Skip stage 7 (process environment discovery).
+      --no-env          Same as --no-stage7 (alias).
   -q, --quiet           Reduce status noise. Findings still printed.
       --no-color        Strip ANSI escape codes.
   -h, --help            Show this help.
@@ -284,6 +310,10 @@ Examples:
   ./credshunter.sh -p /home -p /var/www -p /opt
   ./credshunter.sh --skip-system -p . -q
   ./credshunter.sh -p / -x /var/lib/customer-app
+  ./credshunter.sh --no-stage1 --no-stage2 --no-stage3 --no-stage4 --no-stage5 --no-stage6
+
+Warning: Stage 7 prints matched NAME=VALUE assignments in plaintext. When
+-o is used, those assignments are also written to the findings log.
 
 Exit codes:
   0 = nothing sensitive found (INTEREST / NAME / GIT alone do not change the code)
@@ -444,6 +474,7 @@ parse_args() {
             --no-stage4)      STAGE4_SKIP=1; shift ;;
             --no-stage5)      STAGE5_SKIP=1; shift ;;
             --no-stage6|--no-git) STAGE6_SKIP=1; shift ;;
+            --no-stage7|--no-env) STAGE7_SKIP=1; shift ;;
             -q|--quiet)       QUIET=1; shift ;;
             --no-color)       NO_COLOR_FLAG=1; shift ;;
             -h|--help)        usage; exit 0 ;;
@@ -978,6 +1009,17 @@ sanitize() {
     printf '%s' "$v"
 }
 
+# Preserve the complete environment assignment without allowing control bytes
+# to reach the terminal or log. Newlines/tabs are rendered visibly so a
+# multi-line value stays unambiguous while remaining one TSV record.
+escape_environment_preview() {
+    local v="$1"
+    v="${v//$'\r'/\\r}"
+    v="${v//$'\n'/\\n}"
+    v="${v//$'\t'/\\t}"
+    printf '%s' "$v" | LC_ALL=C tr -d '\000-\010\013\014\016-\037\177'
+}
+
 # Cap a preview for the LIVE feed only (never the Findings section / log). Real
 # credentials are far shorter than the cap, so this only trims pathological
 # multi-KB lines; the complete value still appears in Findings.
@@ -1210,6 +1252,9 @@ stage_skipped() {
 # Returns 0 on a real finding (after FP filter), 1 otherwise.
 classify_line() {
     local content="$1" file="$2" lineno="$3" source_label="$4"
+    local preview_override="${5-}"
+    local has_preview_override=0
+    [ "$#" -ge 5 ] && has_preview_override=1
 
     # Skip pathologically long / trivially short lines before any regex work.
     # Bounds the per-pattern [[ =~ ]] loop on minified/base64/log lines (DoS
@@ -1317,7 +1362,13 @@ classify_line() {
                     is_false_positive "$value" && return 1
                     ;;
             esac
-            record_finding HIGH "${source_label}/${label}" "$file" "$lineno" "$(sanitize "$content")"
+            local finding_preview
+            if [ "$has_preview_override" -eq 1 ]; then
+                finding_preview="$preview_override"
+            else
+                finding_preview="$(sanitize "$content")"
+            fi
+            record_finding HIGH "${source_label}/${label}" "$file" "$lineno" "$finding_preview"
             return 0
         fi
     done
@@ -2158,6 +2209,54 @@ find_git_repositories() {
 }
 
 # ============================================================================
+#  Stage 7 — Process environment credential discovery
+# ============================================================================
+
+scan_process_environment() {
+    local assignment name location preview matched entry label regex safe_name
+
+    if [ "$STARTUP_ENV_MODE" = 'lines' ]; then
+        warn "env -0 is unavailable; multiline environment values may be split."
+    fi
+
+    for assignment in "${STARTUP_ENV[@]}"; do
+        [[ "$assignment" == *=* ]] || continue
+        name="${assignment%%=*}"
+        [ -n "$name" ] || continue
+        case "$name" in PWD|OLDPWD) continue ;; esac
+        safe_name="$(escape_environment_preview "$name")"
+
+        if [ "${#assignment}" -gt "$MAX_LINE_LEN" ]; then
+            warn "Skipping oversized environment variable: ENV:${safe_name} (>16 KiB)"
+            continue
+        fi
+
+        location="ENV:${name}"
+        preview="$(escape_environment_preview "$assignment")"
+        matched=0
+
+        # Private-key markers are a separate KEY bucket in the file scanner;
+        # retain that classification for values carried in the environment.
+        for entry in "${KEY_PATTERNS[@]}"; do
+            label="${entry%%|*}"
+            regex="${entry#*|}"
+            if [[ "$assignment" =~ $regex ]]; then
+                record_finding KEY "process_env/${label}" "$location" 0 "$preview"
+                matched=1
+                break
+            fi
+        done
+
+        if classify_line "$assignment" "$location" 0 process_env "$preview"; then
+            matched=1
+        fi
+        [ "$matched" -eq 1 ] && printf '%s\n' "$safe_name" >>"$ENV_FINDINGS_FILE"
+    done
+
+    [ -s "$ENV_FINDINGS_FILE" ] && sort -u "$ENV_FINDINGS_FILE" -o "$ENV_FINDINGS_FILE"
+}
+
+# ============================================================================
 #  Output / summary
 # ============================================================================
 
@@ -2173,10 +2272,16 @@ render_findings() {
     sort -u "$file" -o "$file"
     local label path lineno preview
     while IFS=$'\t' read -r label path lineno preview; do
-        printf '  %b[%s]%b %b%s%b  %s%s:%s%s\n' \
-            "$color" "$tag" "$NC" "$D" "$label" "$NC" "$Y" "$path" "$lineno" "$NC"
+        if [ "${lineno:-0}" -gt 0 ] 2>/dev/null; then
+            printf '  %b[%s]%b %b%s%b  %s%s:%s%s\n' \
+                "$color" "$tag" "$NC" "$D" "$label" "$NC" "$Y" "$path" "$lineno" "$NC"
+            log_line "[$tag] $label $path:$lineno  $preview"
+        else
+            printf '  %b[%s]%b %b%s%b  %s%s%s\n' \
+                "$color" "$tag" "$NC" "$D" "$label" "$NC" "$Y" "$path" "$NC"
+            log_line "[$tag] $label $path  $preview"
+        fi
         printf '       %b%s%b\n' "$D" "$preview" "$NC"
-        log_line "[$tag] $label $path:$lineno  $preview"
     done <"$file"
 }
 
@@ -2259,13 +2364,14 @@ print_summary() {
     fi
 
     # Counts
-    local n_guar n_high n_key n_int n_name n_git n_check n_skip
+    local n_guar n_high n_key n_int n_name n_git n_env n_check n_skip
     n_guar=$( [ -s "$GUARANTEED_FILE" ] && wc -l <"$GUARANTEED_FILE" | tr -d ' ' || echo 0)
     n_high=$( [ -s "$HIGH_FILE" ]    && wc -l <"$HIGH_FILE"    | tr -d ' ' || echo 0)
     n_key=$(  [ -s "$KEY_FILE" ]     && wc -l <"$KEY_FILE"     | tr -d ' ' || echo 0)
     n_int=$(  [ -s "$INTEREST_FILE" ]&& wc -l <"$INTEREST_FILE"| tr -d ' ' || echo 0)
     n_name=$( [ -s "$NAME_FILE" ]    && wc -l <"$NAME_FILE"    | tr -d ' ' || echo 0)
     n_git=$(  [ -s "$GIT_FILE" ]     && wc -l <"$GIT_FILE"     | tr -d ' ' || echo 0)
+    n_env=$(  [ -s "$ENV_FINDINGS_FILE" ] && wc -l <"$ENV_FINDINGS_FILE" | tr -d ' ' || echo 0)
     n_check=$([ -s "$CHECKED_FILE" ] && wc -l <"$CHECKED_FILE" | tr -d ' ' || echo 0)
     n_skip=$( [ -s "$SKIPPED_FILE" ] && wc -l <"$SKIPPED_FILE" | tr -d ' ' || echo 0)
 
@@ -2276,6 +2382,7 @@ print_summary() {
     sum_row "$C"      "Auxiliary credential-related files"     "$n_int"
     sum_row "$Y"      "Suspicious filenames (substring)"       "$n_name"
     sum_row "$B"      "Git repositories found"                  "$n_git"
+    sum_row "$R"      "Environment credential findings"         "$n_env"
     sum_row "$B"      "OS locations checked"                   "$n_check"
     sum_row "$D"      "Files skipped (size/binary/perm)"       "$n_skip"
 
@@ -2287,6 +2394,7 @@ print_summary() {
     log_line "  Auxiliary credential-related:    $n_int"
     log_line "  Suspicious filenames (substring):$n_name"
     log_line "  Git repositories found:           $n_git"
+    log_line "  Environment credential findings:  $n_env"
     log_line "  OS locations checked:            $n_check"
     log_line "  Files skipped:                   $n_skip"
 
@@ -2341,7 +2449,7 @@ main() {
 
     if [ ${#SCAN_PATHS[@]} -eq 0 ]; then
         warn "No paths supplied (-p). Skipping stages 2-6."
-        warn "Tip: pass -p / to scan everything under root."
+        warn "Tip: pass -p / to scan files as well as the process environment."
     else
         if [ "$STAGE2_SKIP" -eq 0 ]; then
             stage_begin 2; find_guaranteed_credentials; stage_end 2 "Confirmed credential containers"
@@ -2368,6 +2476,14 @@ main() {
         else
             stage_skipped 6 "Git repository discovery"
         fi
+    fi
+
+    if [ "$STAGE7_SKIP" -eq 0 ]; then
+        stage_begin 7
+        scan_process_environment
+        stage_end 7 "Process environment credential discovery"
+    else
+        stage_skipped 7 "Process environment credential discovery"
     fi
 
     print_summary
