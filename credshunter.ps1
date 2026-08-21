@@ -193,9 +193,32 @@ $script:Stage7Skip = $NoStage7.IsPresent
 
 # Resolve our own path so we never scan ourselves
 $script:SelfPath = $null
-try { $script:SelfPath = $PSCommandPath } catch {}
-if ([string]::IsNullOrEmpty($script:SelfPath)) {
-    try { $script:SelfPath = $MyInvocation.MyCommand.Path } catch {}
+try {
+    $selfCandidate = $PSCommandPath
+    if ([string]::IsNullOrEmpty($selfCandidate)) {
+        $selfCandidate = $MyInvocation.MyCommand.Path
+    }
+    if (-not [string]::IsNullOrEmpty($selfCandidate)) {
+        $script:SelfPath = [System.IO.Path]::GetFullPath($selfCandidate)
+    }
+} catch {
+    $script:SelfPath = $null
+}
+
+function Test-IsSelfPath {
+    param([string]$Path)
+    if ([string]::IsNullOrEmpty($script:SelfPath) -or [string]::IsNullOrEmpty($Path)) {
+        return $false
+    }
+    try {
+        $candidate = [System.IO.Path]::GetFullPath($Path)
+        return $candidate.Equals(
+            $script:SelfPath,
+            [System.StringComparison]::OrdinalIgnoreCase
+        )
+    } catch {
+        return $false
+    }
 }
 
 # ----------------------------------------------------------------------------
@@ -1557,7 +1580,7 @@ function Add-Skipped { param([string]$Path, [string]$Reason)
 #   5. Skip pathologically long lines (> MaxLineLen, 16 KB) -- minified JS,
 #      base64 blobs, or log rotations, never credential assignments.
 function Invoke-ScanFile { param([string]$FullPath, [string]$SourceLabel = 'content', [long]$KnownSize = -1)
-    if ($script:SelfPath -and $FullPath -eq $script:SelfPath) { return }
+    if (Test-IsSelfPath -Path $FullPath) { return }
     if (-not $script:ScannedPaths.Add($FullPath)) { return }
 
     # Cheap filename-based skip BEFORE any I/O: LICENSE, CHANGELOG, package-lock,
@@ -2748,6 +2771,7 @@ function Get-WalkedFiles { param([string[]]$Paths)
             # A single file passed directly as -Path.
             try {
                 $fi = New-Object System.IO.FileInfo $abs
+                if (Test-IsSelfPath -Path $fi.FullName) { continue }
                 $result.Add([PSCustomObject]@{
                     Path = $fi.FullName; Name = $fi.Name.ToLowerInvariant()
                     Ext  = $fi.Extension.ToLowerInvariant(); Size = $fi.Length })
@@ -2796,6 +2820,7 @@ function Get-WalkedFiles { param([string[]]$Paths)
                     # pass them so Test-DirectoryExcluded does not re-stat the directory.
                     if (-not (Test-DirectoryExcluded -DirectoryPath $info.FullName -KnownAttributes $info.Attributes)) { $stack.Push($info.FullName) }
                 } else {
+                    if (Test-IsSelfPath -Path $info.FullName) { continue }
                     $result.Add([PSCustomObject]@{
                         Path = $info.FullName; Name = $info.Name.ToLowerInvariant()
                         Ext  = $info.Extension.ToLowerInvariant(); Size = $info.Length })
@@ -2871,7 +2896,6 @@ function Find-SuspiciousNames { param($Files)
                     '.ax','.efi','.mui','.so','.dylib','.lib','.bin',
                     '.tlb','.olb','.tlh','.pdb','.ilk','.nupkg'),
         [System.StringComparer]::OrdinalIgnoreCase)
-    $selfName = if ($script:SelfPath) { [System.IO.Path]::GetFileName($script:SelfPath).ToLowerInvariant() } else { '' }
     $tokens = @($script:Stage4NameTokens | ForEach-Object { $_.ToLowerInvariant() })
 
     foreach ($e in $Files) {
@@ -2879,7 +2903,6 @@ function Find-SuspiciousNames { param($Files)
         # secrets.ppk, ...) is already [CRITICAL]; don't also down-tag it to a
         # mere [NAME] substring hit.
         if ($script:GuaranteedHashes.Contains($e.Path)) { continue }
-        if ($selfName -and $e.Name -eq $selfName) { continue }
         if ($binaryExts.Contains($e.Ext)) { continue }
         foreach ($t in $tokens) {
             if ($e.Name.Contains($t)) { Add-SuspiciousName -Path $e.Path; break }
