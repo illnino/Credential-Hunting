@@ -62,8 +62,20 @@ R='' G='' Y='' B='' M='' C='' W='' D='' BOLD='' NC=''
 GH='-' GHV='=' GTL='+' GTR='+' GBL='+' GBR='+'
 GBRANCH='+-' GBUL='>' GDOT='-' GELL='...' GWARN='!' GARROW='->'
 
-# Resolve the script's own canonical path so we never grep ourselves.
-SCRIPT_PATH=$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")
+# Resolve the script's own canonical path so we never grep ourselves. Avoid the
+# GNU-only `--` operand separator because BSD readlink rejects it.
+SCRIPT_PATH=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")
+
+# Compare filesystem identity instead of path spelling. This survives relative
+# invocation, symlink aliases, and hard links while leaving separate same-named
+# copies eligible for scanning.
+is_self_file() {
+    local candidate="$1"
+    [ -n "${SCRIPT_PATH:-}" ] &&
+        [ -e "$candidate" ] &&
+        [ -e "$SCRIPT_PATH" ] &&
+        [ "$candidate" -ef "$SCRIPT_PATH" ]
+}
 
 # ----------------------------------------------------------------------------
 #  Defaults
@@ -1379,8 +1391,8 @@ classify_line() {
 scan_file() {
     local file="$1" source_label="${2:-content}"
 
-    # Skip our own script
-    [ "$file" = "$SCRIPT_PATH" ] && return
+    # Skip the executing script regardless of relative/absolute path spelling.
+    is_self_file "$file" && return
 
     # Per-path dedup. Stage 1's targeted lists can reference the same file
     # under different names / symlinks, so it keys on the canonical path
@@ -1981,6 +1993,7 @@ find_guaranteed_credentials() {
         [ -e "$path" ] || continue
         while IFS= read -r -d '' f; do
             [ -z "$f" ] && continue
+            is_self_file "$f" && continue
             local ext_only="${f##*.}"
             record_guaranteed "${ext_only,,}" "$f"
         done < <(find -H "$path" "${FIND_EXCLUDE_ARGS[@]}" -type f "${name_expr[@]}" -print0 2>/dev/null)
@@ -2022,6 +2035,7 @@ find_high_value_files() {
         [ -e "$path" ] || continue
         while IFS= read -r -d '' f; do
             [ -z "$f" ] && continue
+            is_self_file "$f" && continue
             # Stage 2 dedup -- skip files already flagged as guaranteed
             [ -n "${STAGE2_HITS[$f]:-}" ] && continue
             # SKIP_DB_BASENAMES filter (MS SQL Server templates)
@@ -2047,8 +2061,7 @@ find_high_value_files() {
 # "shadow", "history") to STAGE4_NAME_TOKENS at the top of this script.
 find_suspicious_filenames() {
     build_find_excludes
-    local path self_name
-    self_name="${SCRIPT_PATH##*/}"
+    local path
 
     # Dedup against Stage 2: a confirmed credential container (e.g.
     # passwords.kdbx, secrets.ppk) is already reported as [CRITICAL]; do not
@@ -2065,12 +2078,11 @@ find_suspicious_filenames() {
         [ -e "$path" ] || continue
         while IFS= read -r -d '' f; do
             [ -z "$f" ] && continue
+            is_self_file "$f" && continue
             # Skip files already flagged as confirmed containers in Stage 2
             [ -n "${STAGE2_HITS[$f]:-}" ] && continue
             local bn="${f##*/}"
             local bn_lower="${bn,,}"
-            # Skip our own script
-            [ "$bn" = "$self_name" ] && continue
             local t
             for t in "${STAGE4_NAME_TOKENS[@]}"; do
                 if [[ "$bn_lower" == *"${t,,}"* ]]; then
@@ -2137,7 +2149,11 @@ scan_user_paths_contents() {
     [ ${#SCAN_PATHS[@]} -eq 0 ] && { warn "No paths provided; skipping."; return; }
     info "Enumerating candidate files…"
     # NUL-delimited throughout so filenames containing spaces/newlines survive.
-    enumerate_candidates >"$CANDIDATE_FILES" 2>/dev/null
+    # Exclude the executing inode before counting candidates. A separate copy
+    # with the same basename remains eligible.
+    while IFS= read -r -d '' candidate; do
+        is_self_file "$candidate" || printf '%s\0' "$candidate"
+    done < <(enumerate_candidates 2>/dev/null) >"$CANDIDATE_FILES"
     [ -s "$CANDIDATE_FILES" ] && sort -z -u "$CANDIDATE_FILES" -o "$CANDIDATE_FILES"
     local total
     total=$(tr -cd '\0' <"$CANDIDATE_FILES" | wc -c | tr -d ' ')
