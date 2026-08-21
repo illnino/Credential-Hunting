@@ -31,6 +31,10 @@ if not exist "%CH_TMPDIR%\" (
 set > "%CH_TMPDIR%\environment.txt"
 set "ENV_SNAPSHOT=%CH_TMPDIR%\environment.txt"
 
+:: Normalized path of the currently executing script. Stages 2-5 filter this
+:: exact path from their shared inventory; other same-named copies remain.
+set "SELF_PATH=%~f0"
+
 set "VERSION=2.5.0-bat"
 set /a EXITCODE=0
 
@@ -430,7 +434,8 @@ for %%P in (%PATHS%) do (
     if exist "!thisPath!\" (
         call :WalkDir "!thisPath!"
     ) else if exist "!thisPath!" (
-        echo !thisPath! >> "%FILELIST%"
+        set "directPath=%%~fP"
+        if /I not "!directPath!"=="!SELF_PATH!" echo !directPath! >> "%FILELIST%"
     ) else (
         if not defined QUIET echo !CY![!] Path does not exist: !thisPath!!CNC!
     )
@@ -979,6 +984,11 @@ set "startDir=%~1"
 for /f "delims=" %%F in ('dir /S /B /A:-D "!startDir!\" 2^>nul') do (
     set "fp=%%~fF"
     set "skip=0"
+    set "skipself=0"
+    if /I "!fp!"=="!SELF_PATH!" (
+        set "skip=1"
+        set "skipself=1"
+    )
     for %%P in (!EXCL_PREFIXES!) do (
         if not !skip!==1 (
             echo !fp! ^| findstr /I /B "%%~P" >nul 2>&1
@@ -998,8 +1008,10 @@ for /f "delims=" %%F in ('dir /S /B /A:-D "!startDir!\" 2^>nul') do (
         )
     )
     if !skip!==1 (
-        echo [SKIP] excluded_path  !fp! >> "%SKIPPED%"
-        set /a nSkip+=1
+        if !skipself!==0 (
+            echo [SKIP] excluded_path  !fp! >> "%SKIPPED%"
+            set /a nSkip+=1
+        )
     ) else (
         echo !fp! >> "%FILELIST%"
     )
@@ -1762,7 +1774,8 @@ set /a nCheck+=1
 goto :EOF
 
 :ScanFile
-set "sPath=%~1"
+for %%I in ("%~1") do set "sPath=%%~fI"
+if /I "!sPath!"=="!SELF_PATH!" goto :EOF
 set "sLabel=%~2"
 findstr /I /M /G:"%KEYPATTERNS%" "!sPath!" >nul 2>&1
 if !errorlevel!==0 (
