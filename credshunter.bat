@@ -492,17 +492,19 @@ goto :EOF
 :Stage1_GPP
 if not defined QUIET echo !CB![*] Stage 1.2 - Group Policy Preferences cpassword!CNC!
 for %%R in ("%SystemRoot%\SYSVOL" "%ProgramData%\Microsoft\Group Policy\History" "%SystemRoot%\System32\GroupPolicy") do (
-    if exist "%%~R\" (
-        call :AddChecked "gpp_root" "%%~R"
+    set "gppRoot=%%~R"
+    if exist "!gppRoot!\" (
+        call :AddChecked "gpp_root" "!gppRoot!"
         for %%X in (Groups Services ScheduledTasks DataSources Drives Printers) do (
-            if exist "%%~R\%%X.xml" (
-                call :AddChecked "gpp_xml" "%%~R\%%X.xml"
-                findstr /I /M /C:"cpassword=" "%%~R\%%X.xml" >nul 2>&1
+            set "gppFile=!gppRoot!\%%X.xml"
+            if exist "!gppFile!" (
+                call :AddChecked "gpp_xml" "!gppFile!"
+                findstr /I /M /C:"cpassword=" "!gppFile!" >nul 2>&1
                 if !errorlevel!==0 (
-                    call :AddHigh "gpp/cpassword" "%%~R\%%X.xml" "0" "cpassword found"
+                    call :AddHigh "gpp/cpassword" "!gppFile!" "0" "cpassword found"
                 )
             )
-            for /r "%%~R" %%F in (%%X.xml) do (
+            for /r "!gppRoot!" %%F in (%%X.xml) do (
                 call :AddChecked "gpp_xml" "%%~F"
                 findstr /I /M /C:"cpassword=" "%%~F" >nul 2>&1
                 if !errorlevel!==0 (
@@ -543,8 +545,10 @@ for %%H in (
     if exist "%%~H" call :ScanFile "%%~H" "powershell_history"
 )
 for /d %%U in ("%SystemDrive%\Users\*") do (
-    if exist "%%~U\AppData\Roaming\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt" (
-        call :ScanFile "%%~U\AppData\Roaming\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt" "powershell_history"
+    set "psUserRoot=%%~U"
+    set "psHistoryFile=!psUserRoot!\AppData\Roaming\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt"
+    if exist "!psHistoryFile!" (
+        call :ScanFile "!psHistoryFile!" "powershell_history"
     )
 )
 goto :EOF
@@ -564,10 +568,12 @@ for %%D in (
     "%USERPROFILE%\AppData\Local\Microsoft\Vault"
     "%USERPROFILE%\AppData\Roaming\Microsoft\Vault"
 ) do (
-    if exist "%%~D\" (
-        call :AddChecked "vault_dir" "%%~D"
-        for /f %%F in ('dir /B /A:-D "%%~D" 2^>nul') do (
-            call :AddInterest "windows_vault_file" "%%~D\%%F"
+    set "vaultRoot=%%~D"
+    if exist "!vaultRoot!\" (
+        call :AddChecked "vault_dir" "!vaultRoot!"
+        for /f %%F in ('dir /B /A:-D "!vaultRoot!" 2^>nul') do (
+            set "vaultEntry=!vaultRoot!\%%F"
+            call :AddInterest "windows_vault_file" "!vaultEntry!"
         )
     )
 )
@@ -592,8 +598,9 @@ if !errorlevel!==0 (
     call :AddInterest "winscp_session_review" "HKCU\WinSCP 2\Sessions"
 )
 for %%D in ("%APPDATA%" "%LOCALAPPDATA%" "%USERPROFILE%") do (
-    if exist "%%~D\" (
-        for /r "%%~D" %%F in (WinSCP.ini) do (
+    set "winscpRoot=%%~D"
+    if exist "!winscpRoot!\" (
+        for /r "!winscpRoot!" %%F in (WinSCP.ini) do (
             call :AddInterest "winscp_ini" "%%~F"
             call :ScanFile "%%~F" "winscp_ini"
         )
@@ -727,16 +734,18 @@ goto :EOF
 :Stage1_Browser
 if not defined QUIET echo !CB![*] Stage 1.15 - Browser credential databases!CNC!
 for /d %%U in ("%SystemDrive%\Users\*") do (
+    set "browserUserRoot=%%~U"
     for %%F in (
-        "%%~U\AppData\Local\Google\Chrome\User Data\Default\Login Data"
-        "%%~U\AppData\Local\Microsoft\Edge\User Data\Default\Login Data"
-        "%%~U\AppData\Local\BraveSoftware\Brave-Browser\User Data\Default\Login Data"
-        "%%~U\AppData\Roaming\Opera Software\Opera Stable\Login Data"
+        "!browserUserRoot!\AppData\Local\Google\Chrome\User Data\Default\Login Data"
+        "!browserUserRoot!\AppData\Local\Microsoft\Edge\User Data\Default\Login Data"
+        "!browserUserRoot!\AppData\Local\BraveSoftware\Brave-Browser\User Data\Default\Login Data"
+        "!browserUserRoot!\AppData\Roaming\Opera Software\Opera Stable\Login Data"
     ) do (
         if exist "%%~F" call :AddInterest "browser_credentials" "%%~F"
     )
-    if exist "%%~U\AppData\Roaming\Mozilla\Firefox\Profiles\" (
-        call :AddInterest "firefox_profiles" "%%~U\AppData\Roaming\Mozilla\Firefox\Profiles"
+    set "firefoxProfiles=!browserUserRoot!\AppData\Roaming\Mozilla\Firefox\Profiles"
+    if exist "!firefoxProfiles!\" (
+        call :AddInterest "firefox_profiles" "!firefoxProfiles!"
     )
 )
 goto :EOF
@@ -744,25 +753,26 @@ goto :EOF
 :Stage1_CloudCLI
 if not defined QUIET echo !CB![*] Stage 1.16 - Cloud CLI credential stores!CNC!
 for /d %%U in ("%SystemDrive%\Users\*") do (
+    set "cloudUserRoot=%%~U"
     for %%F in (
-        "%%~U\.aws\credentials"
-        "%%~U\.aws\config"
-        "%%~U\.azure\accessTokens.json"
-        "%%~U\.azure\azureProfile.json"
-        "%%~U\.kube\config"
-        "%%~U\.docker\config.json"
-        "%%~U\.netrc"
-        "%%~U\_netrc"
-        "%%~U\.git-credentials"
-        "%%~U\.npmrc"
-        "%%~U\.pypirc"
-        "%%~U\.s3cfg"
-        "%%~U\AppData\Roaming\rclone\rclone.conf"
-        "%%~U\AppData\Roaming\gcloud\credentials.db"
-        "%%~U\AppData\Roaming\gcloud\access_tokens.db"
-        "%%~U\AppData\Roaming\gcloud\application_default_credentials.json"
-        "%%~U\.config\gcloud\credentials.db"
-        "%%~U\.config\gcloud\application_default_credentials.json"
+        "!cloudUserRoot!\.aws\credentials"
+        "!cloudUserRoot!\.aws\config"
+        "!cloudUserRoot!\.azure\accessTokens.json"
+        "!cloudUserRoot!\.azure\azureProfile.json"
+        "!cloudUserRoot!\.kube\config"
+        "!cloudUserRoot!\.docker\config.json"
+        "!cloudUserRoot!\.netrc"
+        "!cloudUserRoot!\_netrc"
+        "!cloudUserRoot!\.git-credentials"
+        "!cloudUserRoot!\.npmrc"
+        "!cloudUserRoot!\.pypirc"
+        "!cloudUserRoot!\.s3cfg"
+        "!cloudUserRoot!\AppData\Roaming\rclone\rclone.conf"
+        "!cloudUserRoot!\AppData\Roaming\gcloud\credentials.db"
+        "!cloudUserRoot!\AppData\Roaming\gcloud\access_tokens.db"
+        "!cloudUserRoot!\AppData\Roaming\gcloud\application_default_credentials.json"
+        "!cloudUserRoot!\.config\gcloud\credentials.db"
+        "!cloudUserRoot!\.config\gcloud\application_default_credentials.json"
     ) do (
         if exist "%%~F" (
             call :AddInterest "cloud_credential_file" "%%~F"
@@ -775,9 +785,11 @@ goto :EOF
 :Stage1_SSH
 if not defined QUIET echo !CB![*] Stage 1.17 - SSH keys in user profiles!CNC!
 for /d %%U in ("%SystemDrive%\Users\*") do (
-    if exist "%%~U\.ssh\" (
-        call :AddChecked "ssh_dir" "%%~U\.ssh"
-        for %%F in ("%%~U\.ssh\*") do (
+    set "sshUserRoot=%%~U"
+    set "sshDir=!sshUserRoot!\.ssh"
+    if exist "!sshDir!\" (
+        call :AddChecked "ssh_dir" "!sshDir!"
+        for %%F in ("!sshDir!\*") do (
             call :ScanFile "%%~F" "ssh"
         )
     )
@@ -796,8 +808,9 @@ if !errorlevel!==0 (
     call :AddChecked "rdp_registry" "HKCU\...\Terminal Server Client\Default"
 )
 for %%D in ("%USERPROFILE%" "%PUBLIC%" "%SystemDrive%\Users") do (
-    if exist "%%~D\" (
-        for /r "%%~D" %%F in (*.rdp *.rdg) do (
+    set "rdpRoot=%%~D"
+    if exist "!rdpRoot!\" (
+        for /r "!rdpRoot!" %%F in (*.rdp *.rdg) do (
             call :AddInterest "saved_rdp_file" "%%~F"
             call :ScanFile "%%~F" "rdp_file"
         )
@@ -864,9 +877,10 @@ goto :EOF
 :Stage1_StickyNotes
 if not defined QUIET echo !CB![*] Stage 1.22 - Sticky Notes!CNC!
 for /d %%U in ("%SystemDrive%\Users\*") do (
+    set "stickyUserRoot=%%~U"
     for %%F in (
-        "%%~U\AppData\Local\Packages\Microsoft.MicrosoftStickyNotes_8wekyb3d8bbwe\LocalState\plum.sqlite"
-        "%%~U\AppData\Roaming\Microsoft\Sticky Notes\StickyNotes.snt"
+        "!stickyUserRoot!\AppData\Local\Packages\Microsoft.MicrosoftStickyNotes_8wekyb3d8bbwe\LocalState\plum.sqlite"
+        "!stickyUserRoot!\AppData\Roaming\Microsoft\Sticky Notes\StickyNotes.snt"
     ) do (
         if exist "%%~F" call :AddInterest "sticky_notes" "%%~F"
     )
@@ -922,8 +936,9 @@ goto :EOF
 :Stage1_DBClients
 if not defined QUIET echo !CB![*] Stage 1.27 - DB GUI clients!CNC!
 for %%D in ("%APPDATA%\DBeaverData" "%APPDATA%\DBeaver") do (
-    if exist "%%~D\" (
-        for /r "%%~D" %%F in (*) do (
+    set "dbeaverRoot=%%~D"
+    if exist "!dbeaverRoot!\" (
+        for /r "!dbeaverRoot!" %%F in (*) do (
             if "%%~nxF"=="credentials-config.json" call :AddInterest "dbeaver_credentials" "%%~F"
             if "%%~nxF"=="data-sources.json" call :AddInterest "dbeaver_credentials" "%%~F"
         )
@@ -939,19 +954,24 @@ goto :EOF
 :Stage1_AppServers
 if not defined QUIET echo !CB![*] Stage 1.28 - App servers (Jenkins / Tomcat)!CNC!
 for %%R in ("%SystemDrive%\Jenkins" "%ProgramData%\Jenkins\.jenkins" "%ProgramFiles%\Jenkins") do (
-    if exist "%%~R\" (
-        for %%F in ("%%~R\credentials.xml" "%%~R\secrets\master.key" "%%~R\secrets\hudson.util.Secret") do (
+    set "jenkinsRoot=%%~R"
+    if exist "!jenkinsRoot!\" (
+        for %%F in ("!jenkinsRoot!\credentials.xml" "!jenkinsRoot!\secrets\master.key" "!jenkinsRoot!\secrets\hudson.util.Secret") do (
             if exist "%%~F" call :AddInterest "jenkins_secret" "%%~F"
         )
-        if exist "%%~R\credentials.xml" call :ScanFile "%%~R\credentials.xml" "jenkins"
+        set "jenkinsCredentials=!jenkinsRoot!\credentials.xml"
+        if exist "!jenkinsCredentials!" call :ScanFile "!jenkinsCredentials!" "jenkins"
     )
 )
 for %%D in ("%ProgramFiles%\Apache Software Foundation" "%ProgramFiles(x86)%\Apache Software Foundation") do (
-    if exist "%%~D\" (
-        for /d %%T in ("%%~D\Tomcat*") do (
-            if exist "%%~T\conf\tomcat-users.xml" (
-                call :AddInterest "tomcat_users" "%%~T\conf\tomcat-users.xml"
-                call :ScanFile "%%~T\conf\tomcat-users.xml" "tomcat"
+    set "appServerRoot=%%~D"
+    if exist "!appServerRoot!\" (
+        for /d %%T in ("!appServerRoot!\Tomcat*") do (
+            set "tomcatRoot=%%~T"
+            set "tomcatUsers=!tomcatRoot!\conf\tomcat-users.xml"
+            if exist "!tomcatUsers!" (
+                call :AddInterest "tomcat_users" "!tomcatUsers!"
+                call :ScanFile "!tomcatUsers!" "tomcat"
             )
         )
     )
@@ -963,9 +983,11 @@ if not defined QUIET echo !CB![*] Stage 1.29 - .NET user-secrets!CNC!
 if exist "%APPDATA%\Microsoft\UserSecrets\" (
     call :AddChecked "dotnet_user_secrets" "%APPDATA%\Microsoft\UserSecrets"
     for /d %%D in ("%APPDATA%\Microsoft\UserSecrets\*") do (
-        if exist "%%~D\secrets.json" (
-            call :AddInterest "dotnet_user_secrets" "%%~D\secrets.json"
-            call :ScanFile "%%~D\secrets.json" "user_secrets"
+        set "userSecretsRoot=%%~D"
+        set "userSecretsFile=!userSecretsRoot!\secrets.json"
+        if exist "!userSecretsFile!" (
+            call :AddInterest "dotnet_user_secrets" "!userSecretsFile!"
+            call :ScanFile "!userSecretsFile!" "user_secrets"
         )
     )
 )
