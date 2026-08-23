@@ -2229,28 +2229,165 @@ function Test-SNMPRegistry {
     } catch {}
 }
 
-function Test-SAMHives {
-    Write-Info "Stage 1.10 - SAM/SYSTEM/SECURITY hive files"
-    $hives = @(
-        (Join-Path $env:SystemRoot 'System32\config\SAM')
-        (Join-Path $env:SystemRoot 'System32\config\SYSTEM')
-        (Join-Path $env:SystemRoot 'System32\config\SECURITY')
-        (Join-Path $env:SystemRoot 'repair\SAM')
-        (Join-Path $env:SystemRoot 'repair\SYSTEM')
-        (Join-Path $env:SystemRoot 'repair\SECURITY')
-        (Join-Path $env:SystemRoot 'System32\config\RegBack\SAM')
-        (Join-Path $env:SystemRoot 'System32\config\RegBack\SYSTEM')
-        (Join-Path $env:SystemRoot 'System32\config\RegBack\SECURITY')
-    )
-    foreach ($h in $hives) {
-        if (-not (Test-Path -LiteralPath $h)) { continue }
-        Add-Checked -Label 'sam_hive' -Path $h
+function Get-FixedDriveRoots {
+    $roots = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    try {
+        Get-CimInstance Win32_LogicalDisk -ErrorAction SilentlyContinue |
+            Where-Object { $_.DriveType -eq 3 -and $_.DeviceID } |
+            ForEach-Object {
+                $root = $_.DeviceID
+                if (-not $root.EndsWith('\')) { $root += '\' }
+                [void]$roots.Add($root)
+            }
+    } catch {}
+    if ($roots.Count -eq 0) {
         try {
-            $fs = [System.IO.File]::OpenRead($h)
-            $fs.Close()
-            Add-Interesting -Category 'readable_hive' -Path $h
-            Add-Finding -Bucket Key -Label 'readable_sam_hive' -Path $h -LineNumber 0 -Preview "Hive readable - extract with secretsdump.py / impacket-secretsdump"
+            Get-WmiObject Win32_LogicalDisk -ErrorAction SilentlyContinue |
+                Where-Object { $_.DriveType -eq 3 -and $_.DeviceID } |
+                ForEach-Object {
+                    $root = $_.DeviceID
+                    if (-not $root.EndsWith('\')) { $root += '\' }
+                    [void]$roots.Add($root)
+                }
         } catch {}
+    }
+    return @($roots)
+}
+
+function Test-BackupTokenPath {
+    param([string]$Path)
+    return ($Path -match '(?i)(\\|/)(backup|bak|old|image|snapshot|copy|export|dump)(\\|/|$)')
+}
+
+function Test-NtdsBackupPath {
+    param([string]$Path)
+    return (Test-BackupTokenPath -Path $Path) -and ($Path -match '(?i)(ntds|active directory|windows)')
+}
+
+function Get-CandidateWindowsRoots {
+    $roots = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    if ($env:SystemRoot) { [void]$roots.Add($env:SystemRoot) }
+    foreach ($drive in Get-FixedDriveRoots) {
+        foreach ($candidate in @(
+            (Join-Path $drive 'Windows'),
+            (Join-Path $drive 'Windows.old\Windows')
+        )) {
+            if (Test-Path -LiteralPath $candidate -PathType Container) { [void]$roots.Add($candidate) }
+        }
+
+        $pending = [System.Collections.Generic.Stack[string]]::new()
+        if (Test-Path -LiteralPath $drive -PathType Container) {
+            $pending.Push($drive)
+        }
+        while ($pending.Count -gt 0) {
+            $current = $pending.Pop()
+            $dirs = @(Get-ChildItem -LiteralPath $current -Directory -Force -ErrorAction SilentlyContinue)
+            foreach ($dir in $dirs) {
+                if (Test-DirectoryExcluded -DirectoryPath $dir.FullName -KnownAttributes $dir.Attributes) { continue }
+                if ($dir.Name -ieq 'Windows' -and (Test-BackupTokenPath -Path $dir.FullName)) {
+                    [void]$roots.Add($dir.FullName)
+                }
+                $pending.Push($dir.FullName)
+            }
+        }
+    }
+    return @($roots)
+}
+
+function Get-BackupArtifactCandidates {
+    param([string[]]$FileNames)
+
+    $targetNames = [System.Collections.Generic.HashSet[string]]::new([string[]]$FileNames, [System.StringComparer]::OrdinalIgnoreCase)
+    $results = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $pending = [System.Collections.Generic.Stack[string]]::new()
+
+    foreach ($drive in Get-FixedDriveRoots) {
+        if (-not (Test-Path -LiteralPath $drive -PathType Container)) { continue }
+        if (-not (Test-DirectoryExcluded -DirectoryPath $drive)) { $pending.Push($drive) }
+    }
+
+    while ($pending.Count -gt 0) {
+        $current = $pending.Pop()
+        $items = @(Get-ChildItem -LiteralPath $current -Force -ErrorAction SilentlyContinue)
+        foreach ($item in $items) {
+            if ($item.PSIsContainer) {
+                if (-not (Test-DirectoryExcluded -DirectoryPath $item.FullName -KnownAttributes $item.Attributes)) {
+                    $pending.Push($item.FullName)
+                }
+                continue
+            }
+            if ($targetNames.Contains($item.Name)) { [void]$results.Add($item.FullName) }
+        }
+    }
+
+    return @($results)
+}
+
+function Test-ReadableArtifact {
+    param([string]$Path)
+    try {
+        $fs = [System.IO.File]::OpenRead($Path)
+        $fs.Close()
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Add-HiveArtifactResult {
+    param(
+        [string]$Path,
+        [string]$CheckedLabel,
+        [string]$ReadableCategory,
+        [string]$ReadableLabel,
+        [string]$Preview
+    )
+
+    Add-Checked -Label $CheckedLabel -Path $Path
+    if (Test-ReadableArtifact -Path $Path) {
+        Add-Interesting -Category $ReadableCategory -Path $Path
+        Add-Finding -Bucket Key -Label $ReadableLabel -Path $Path -LineNumber 0 -Preview $Preview
+    }
+}
+
+function Test-SAMHives {
+    Write-Info "Stage 1.10 - SAM/SYSTEM/SECURITY/NTDS backup files"
+    $hiveSuffixes = @(
+        'System32\config\SAM'
+        'System32\config\SYSTEM'
+        'System32\config\SECURITY'
+        'repair\SAM'
+        'repair\SYSTEM'
+        'repair\SECURITY'
+        'System32\config\RegBack\SAM'
+        'System32\config\RegBack\SYSTEM'
+        'System32\config\RegBack\SECURITY'
+    )
+    $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($root in Get-CandidateWindowsRoots) {
+        foreach ($suffix in $hiveSuffixes) {
+            $h = Join-Path $root $suffix
+            if (-not (Test-Path -LiteralPath $h -PathType Leaf)) { continue }
+            if (-not $seen.Add($h)) { continue }
+            Add-HiveArtifactResult -Path $h -CheckedLabel 'sam_hive' -ReadableCategory 'readable_hive' -ReadableLabel 'readable_sam_hive' -Preview 'Hive readable - extract with secretsdump.py / impacket-secretsdump'
+        }
+
+        $rootNtds = Join-Path $root 'NTDS\ntds.dit'
+        if ((Test-Path -LiteralPath $rootNtds -PathType Leaf) -and $seen.Add($rootNtds)) {
+            Add-HiveArtifactResult -Path $rootNtds -CheckedLabel 'ntds_file' -ReadableCategory 'readable_ntds' -ReadableLabel 'readable_ntds_dit' -Preview 'NTDS.dit readable - extract with secretsdump.py / impacket-secretsdump'
+        }
+    }
+
+    foreach ($path in Get-BackupArtifactCandidates -FileNames @('SAM','SYSTEM','SECURITY','ntds.dit')) {
+        if (-not $seen.Add($path)) { continue }
+        $name = [System.IO.Path]::GetFileName($path)
+        if ($name -ieq 'ntds.dit') {
+            if (-not (Test-NtdsBackupPath -Path $path)) { continue }
+            Add-HiveArtifactResult -Path $path -CheckedLabel 'ntds_file' -ReadableCategory 'readable_ntds' -ReadableLabel 'readable_ntds_dit' -Preview 'NTDS.dit readable - extract with secretsdump.py / impacket-secretsdump'
+            continue
+        }
+        if (-not (Test-BackupTokenPath -Path $path)) { continue }
+        Add-HiveArtifactResult -Path $path -CheckedLabel 'sam_hive' -ReadableCategory 'readable_hive' -ReadableLabel 'readable_sam_hive' -Preview 'Hive readable - extract with secretsdump.py / impacket-secretsdump'
     }
 }
 
