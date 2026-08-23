@@ -2251,7 +2251,12 @@ function Get-FixedDriveRoots {
                 }
         } catch {}
     }
-    return @($roots)
+    if ($roots.Count -eq 0 -and $env:SystemDrive) {
+        $root = $env:SystemDrive
+        if (-not $root.EndsWith('\')) { $root += '\' }
+        [void]$roots.Add($root)
+    }
+    return @($roots | ForEach-Object { $_ })
 }
 
 function Test-BackupTokenPath {
@@ -2291,7 +2296,7 @@ function Get-CandidateWindowsRoots {
             }
         }
     }
-    return @($roots)
+    return @($roots | ForEach-Object { $_ })
 }
 
 function Get-BackupArtifactCandidates {
@@ -2320,7 +2325,7 @@ function Get-BackupArtifactCandidates {
         }
     }
 
-    return @($results)
+    return @($results | ForEach-Object { $_ })
 }
 
 function Test-ReadableArtifact {

@@ -695,9 +695,18 @@ echo %~1>> "%~2"
 goto :EOF
 
 :Stage1RecordWindowsRoot
-if not exist "%~1\System32\config\" goto :EOF
-for %%A in ("%~1") do set "candidateWindowsRoot=%%~fA"
+set "candidateWindowsRoot=%~1"
+set "candidateRootAccepted="
+if exist "!candidateWindowsRoot!\System32\config\" set "candidateRootAccepted=1"
+if not defined candidateRootAccepted if exist "!candidateWindowsRoot!\System32\SAM" set "candidateRootAccepted=1"
+if not defined candidateRootAccepted if exist "!candidateWindowsRoot!\System32\SYSTEM" set "candidateRootAccepted=1"
+if not defined candidateRootAccepted if exist "!candidateWindowsRoot!\System32\SECURITY" set "candidateRootAccepted=1"
+if not defined candidateRootAccepted if exist "!candidateWindowsRoot!\NTDS\ntds.dit" set "candidateRootAccepted=1"
+if not defined candidateRootAccepted goto :EOF
+for %%A in ("!candidateWindowsRoot!") do set "candidateWindowsRoot=%%~fA"
 call :Stage1AppendUnique "!candidateWindowsRoot!" "%~2"
+set "candidateRootAccepted="
+set "candidateWindowsRoot="
 goto :EOF
 
 :Stage1ProbeWindowsRoot
