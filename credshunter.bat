@@ -645,25 +645,176 @@ if !errorlevel!==0 (
 goto :EOF
 
 :Stage1_SAM
-if not defined QUIET echo !CB![*] Stage 1.10 - SAM/SYSTEM/SECURITY hive files!CNC!
-for %%H in (
-    "%SystemRoot%\System32\config\SAM"
-    "%SystemRoot%\System32\config\SYSTEM"
-    "%SystemRoot%\System32\config\SECURITY"
-    "%SystemRoot%\repair\SAM"
-    "%SystemRoot%\repair\SYSTEM"
-    "%SystemRoot%\repair\SECURITY"
-    "%SystemRoot%\System32\config\RegBack\SAM"
-    "%SystemRoot%\System32\config\RegBack\SYSTEM"
-    "%SystemRoot%\System32\config\RegBack\SECURITY"
-) do (
-    if exist "%%~H" (
-        call :AddChecked "sam_hive" "%%~H"
-        call :AddInterest "readable_hive" "%%~H"
-        call :AddKey "readable_sam_hive" "%%~H" "0" "Hive readable - extract with secretsdump"
+if not defined QUIET echo !CB![*] Stage 1.10 - SAM/SYSTEM/SECURITY/NTDS backup files!CNC!
+if not defined EXCL_DIRS call :BuildExclusions
+set "STAGE1_HIVE_SEEN=%TMPDIR%\stage1_hive_seen.txt"
+set "STAGE1_WINDOWS_ROOTS=%TMPDIR%\stage1_windows_roots.txt"
+set "STAGE1_FIXED_DRIVES=%TMPDIR%\stage1_fixed_drives.txt"
+type nul > "!STAGE1_HIVE_SEEN!"
+type nul > "!STAGE1_WINDOWS_ROOTS!"
+call :Stage1CollectFixedDrives "!STAGE1_FIXED_DRIVES!"
+call :Stage1RecordWindowsRoot "%SystemRoot%" "!STAGE1_WINDOWS_ROOTS!"
+for /f "usebackq delims=" %%D in ("!STAGE1_FIXED_DRIVES!") do (
+    set "fixedDrive=%%~D"
+    if exist "!fixedDrive!\Windows\" call :Stage1RecordWindowsRoot "!fixedDrive!\Windows" "!STAGE1_WINDOWS_ROOTS!"
+    if exist "!fixedDrive!\Windows.old\Windows\" call :Stage1RecordWindowsRoot "!fixedDrive!\Windows.old\Windows" "!STAGE1_WINDOWS_ROOTS!"
+    for /f "delims=" %%B in ('dir /B /A:D "!fixedDrive!\*" 2^>nul') do (
+        set "backupTop=!fixedDrive!\%%~B"
+        call :Stage1PathHasBackupToken "!backupTop!\"
+        if !errorlevel!==0 (
+            if exist "!backupTop!\Windows\" call :Stage1RecordWindowsRoot "!backupTop!\Windows" "!STAGE1_WINDOWS_ROOTS!"
+            for /f "delims=" %%W in ('dir /S /B /A:D "!backupTop!\Windows" 2^>nul') do (
+                call :Stage1RecordWindowsRoot "%%~fW" "!STAGE1_WINDOWS_ROOTS!"
+            )
+        )
     )
 )
+for /f "usebackq delims=" %%R in ("!STAGE1_WINDOWS_ROOTS!") do (
+    call :Stage1ProbeWindowsRoot "%%~fR" "!STAGE1_HIVE_SEEN!"
+)
+for /f "usebackq delims=" %%D in ("!STAGE1_FIXED_DRIVES!") do (
+    call :Stage1LooseBackupDrive "%%~D" "!STAGE1_HIVE_SEEN!"
+)
 goto :EOF
+
+:Stage1CollectFixedDrives
+type nul > "%~1"
+for /f "skip=1 tokens=1" %%D in ('wmic logicaldisk where "DriveType=3" get DeviceID 2^>nul') do (
+    if not "%%~D"=="" call :Stage1AppendUnique "%%~D" "%~1"
+)
+for /f %%N in ('find /V /C "" ^< "%~1"') do set /a driveCount=%%N
+if not defined driveCount set /a driveCount=0
+if !driveCount! LEQ 0 if defined SystemDrive call :Stage1AppendUnique "%SystemDrive%" "%~1"
+set "driveCount="
+goto :EOF
+
+:Stage1AppendUnique
+findstr /I /X /L /C:"%~1" "%~2" >nul 2>&1
+if %errorlevel%==0 goto :EOF
+echo %~1>> "%~2"
+goto :EOF
+
+:Stage1RecordWindowsRoot
+if not exist "%~1\System32\config\" goto :EOF
+for %%A in ("%~1") do set "candidateWindowsRoot=%%~fA"
+call :Stage1AppendUnique "!candidateWindowsRoot!" "%~2"
+goto :EOF
+
+:Stage1ProbeWindowsRoot
+set "probeWindowsRoot=%~1"
+for %%H in (
+    "!probeWindowsRoot!\System32\config\SAM"
+    "!probeWindowsRoot!\System32\config\SYSTEM"
+    "!probeWindowsRoot!\System32\config\SECURITY"
+    "!probeWindowsRoot!\repair\SAM"
+    "!probeWindowsRoot!\repair\SYSTEM"
+    "!probeWindowsRoot!\repair\SECURITY"
+    "!probeWindowsRoot!\System32\config\RegBack\SAM"
+    "!probeWindowsRoot!\System32\config\RegBack\SYSTEM"
+    "!probeWindowsRoot!\System32\config\RegBack\SECURITY"
+) do (
+    if exist "%%~H" call :Stage1RecordHiveArtifact "%%~H" "%~2"
+)
+set "probeNtds=!probeWindowsRoot!\NTDS\ntds.dit"
+if exist "!probeNtds!" call :Stage1RecordNtdsArtifact "!probeNtds!" "%~2"
+set "probeWindowsRoot="
+set "probeNtds="
+goto :EOF
+
+:Stage1LooseBackupDrive
+set "looseDrive=%~1"
+for %%N in (SAM SYSTEM SECURITY ntds.dit) do (
+    for /f "delims=" %%F in ('dir /S /B /A:-D "!looseDrive!\%%~N" 2^>nul') do (
+        set "looseCandidate=%%~fF"
+        call :Stage1FilePathExcluded "!looseCandidate!"
+        if not !errorlevel!==0 (
+            if /I "%%~nxF"=="ntds.dit" (
+                call :Stage1LooseNtdsCandidate "!looseCandidate!" "%~2"
+            ) else (
+                call :Stage1LooseHiveCandidate "!looseCandidate!" "%~2"
+            )
+        )
+    )
+)
+set "looseDrive="
+set "looseCandidate="
+goto :EOF
+
+:Stage1LooseHiveCandidate
+call :Stage1PathHasBackupToken "%~dp1"
+if not %errorlevel%==0 goto :EOF
+call :Stage1RecordHiveArtifact "%~1" "%~2"
+goto :EOF
+
+:Stage1LooseNtdsCandidate
+call :Stage1NtdsBackupPath "%~dp1"
+if not %errorlevel%==0 goto :EOF
+call :Stage1RecordNtdsArtifact "%~1" "%~2"
+goto :EOF
+
+:Stage1RecordHiveArtifact
+call :Stage1ArtifactSeen "%~1" "%~2"
+if %errorlevel%==0 goto :EOF
+call :AddChecked "sam_hive" "%~1"
+call :Stage1FileReadable "%~1"
+if %errorlevel%==0 (
+    call :AddInterest "readable_hive" "%~1"
+    call :AddKey "readable_sam_hive" "%~1" "0" "Hive readable - extract with secretsdump"
+)
+goto :EOF
+
+:Stage1RecordNtdsArtifact
+call :Stage1ArtifactSeen "%~1" "%~2"
+if %errorlevel%==0 goto :EOF
+call :AddChecked "ntds_file" "%~1"
+call :Stage1FileReadable "%~1"
+if %errorlevel%==0 (
+    call :AddInterest "readable_ntds" "%~1"
+    call :AddKey "readable_ntds_dit" "%~1" "0" "NTDS.dit readable - extract with secretsdump"
+)
+goto :EOF
+
+:Stage1ArtifactSeen
+findstr /I /X /L /C:"%~1" "%~2" >nul 2>&1
+if %errorlevel%==0 exit /b 0
+echo %~1>> "%~2"
+exit /b 1
+
+:Stage1FileReadable
+if not exist "%~1" exit /b 1
+>nul type "%~1" 2>nul
+exit /b %errorlevel%
+
+:Stage1PathHasBackupToken
+set "stage1BackupPath=%~1"
+>nul echo(!stage1BackupPath!| findstr /I /R /C:"\\[^\\]*backup[^\\]*\\" /C:"\\[^\\]*bak[^\\]*\\" /C:"\\[^\\]*old[^\\]*\\" /C:"\\[^\\]*image[^\\]*\\" /C:"\\[^\\]*snapshot[^\\]*\\" /C:"\\[^\\]*copy[^\\]*\\" /C:"\\[^\\]*export[^\\]*\\" /C:"\\[^\\]*dump[^\\]*\\" >nul 2>&1
+exit /b !errorlevel!
+
+:Stage1NtdsBackupPath
+call :Stage1PathHasBackupToken "%~1"
+if not %errorlevel%==0 exit /b 1
+set "stage1NtdsPath=%~1"
+>nul echo(!stage1NtdsPath!| findstr /I /R /C:"ntds" /C:"active directory" /C:"windows" >nul 2>&1
+exit /b !errorlevel!
+
+:Stage1FilePathExcluded
+set "stage1Path=%~1"
+if /I "!stage1Path!"=="!SELF_PATH!" exit /b 0
+for %%X in ("!EXCLUDEPATHS:;=" "!") do if not "%%~X"=="" (
+    >nul echo(!stage1Path!| findstr /I /B /L /C:"%%~fX" >nul 2>&1
+    if !errorlevel!==0 exit /b 0
+)
+for %%P in (!EXCL_PREFIXES!) do (
+    >nul echo(!stage1Path!| findstr /I /B /L /C:"%%~P" >nul 2>&1
+    if !errorlevel!==0 exit /b 0
+)
+>nul echo(!stage1Path!| findstr /I "\AppData\Local\Microsoft\Windows\Caches \AppData\Local\Microsoft\Windows\Explorer \AppData\Local\Microsoft\Windows\Notifications \AppData\Local\ConnectedDevicesPlatform \AppData\Local\Microsoft\Edge\User Data\Default\Cache \AppData\Local\Microsoft\Edge\User Data\Default\Code Cache \AppData\Local\Microsoft\Edge\User Data\Default\GPUCache \AppData\Local\Microsoft\Edge\User Data\Default\ShaderCache \AppData\Local\Microsoft\Edge\User Data\Default\Service Worker \AppData\Local\Microsoft\Edge\User Data\BrowserMetrics \AppData\Local\Microsoft\Edge\User Data\Crashpad \AppData\Local\Microsoft\Edge\User Data\ShaderCache \AppData\Local\Google\Chrome\User Data\Default\Cache \AppData\Local\Google\Chrome\User Data\Default\Code Cache \AppData\Roaming\Microsoft\NetFramework\BreadcrumbStore" >nul 2>&1
+if !errorlevel!==0 exit /b 0
+for %%D in (!EXCL_DIRS!) do (
+    >nul echo(!stage1Path!| findstr /I /C:"\%%~D\" >nul 2>&1
+    if !errorlevel!==0 exit /b 0
+)
+exit /b 1
 
 :Stage1_IIS
 if not defined QUIET echo !CB![*] Stage 1.11 - IIS configs!CNC!
