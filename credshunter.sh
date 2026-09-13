@@ -377,6 +377,19 @@ STAGE3_EXTENSIONS=(
     tar tgz gz zip 7z
 )
 
+# Path-only Stage 3 discovery. These formats are reported by default with
+# dedicated tags; Stage 3 itself never reads their contents. Existing Stage 5
+# content-selection behavior remains unchanged.
+STAGE3_OFFICE_EXTENSIONS=(
+    doc docx docm dot dotx dotm
+    xls xlsx xlsm xlsb xlt xltx xltm
+    ppt pptx pptm pot potx potm pps ppsx ppsm
+    vsd vsdx pub mdb accdb
+)
+STAGE3_SQL_EXTENSIONS=(
+    sql ddl dump psql pgsql plsql tsql mdf ndf ldf
+)
+
 # Exact filename matches for Stage 3 (names that cannot be expressed as
 # a simple *.ext glob -- includes dotfiles like .netrc and config files
 # like krb5.conf / my.cnf)
@@ -1067,8 +1080,13 @@ record_finding() {
     [ "$IN_STAGE1" -eq 1 ] && stage1_emit "$bucket" "$label" "$file" "$line" "$preview"
 }
 record_interest() {
+    local tag="${3:-INTEREST}"
+    case "${tag^^}" in
+        INTEREST|OFFICE|SQL) tag="${tag^^}" ;;
+        *)                   tag=INTEREST ;;
+    esac
     _clean_path "$2"
-    printf '%s\t%s\n' "$1" "$REPLY" >>"$INTEREST_FILE"
+    printf '%s\t%s\t%s\n' "$tag" "$1" "$REPLY" >>"$INTEREST_FILE"
     [ "$IN_STAGE1" -eq 1 ] && stage1_emit INTEREST "$1" "$REPLY"
 }
 record_name() {
@@ -1225,7 +1243,10 @@ stage_print_delta() {
                     }
                 }'
             ;;
-        INTEREST|NAME)
+        INTEREST)
+            tail -n "+$start" "$file" | awk -F'\t' '{ printf "  [%-8s]  %s\n", $1, $3 }'
+            ;;
+        NAME)
             tail -n "+$start" "$file" | awk -F'\t' -v t="$tier" '{ p=$NF; printf "  [%-8s]  %s\n", t, p }'
             ;;
         GIT)
@@ -2004,8 +2025,10 @@ find_guaranteed_credentials() {
 }
 
 # Stage 3 -- high-value file types (NEW SPEC)
-# Three sub-passes driven by the top-of-file arrays:
+# One combined find expression driven by the top-of-file arrays:
 #   STAGE3_EXTENSIONS    -- match by extension (case-insensitive)
+#   STAGE3_OFFICE_EXTENSIONS -- report with [OFFICE]
+#   STAGE3_SQL_EXTENSIONS    -- report with [SQL]
 #   STAGE3_EXACT_NAMES   -- match by full basename
 #   STAGE3_GLOB_PATTERNS -- match by find -iname glob (e.g. krb5cc_*)
 #
@@ -2026,7 +2049,9 @@ find_high_value_files() {
 
     # One combined match expression: extensions OR exact filenames OR globs.
     local match=() e n gp
-    for e  in "${STAGE3_EXTENSIONS[@]}";    do match+=( -o -iname "*.${e}" ); done
+    for e  in "${STAGE3_EXTENSIONS[@]}";        do match+=( -o -iname "*.${e}" ); done
+    for e  in "${STAGE3_OFFICE_EXTENSIONS[@]}"; do match+=( -o -iname "*.${e}" ); done
+    for e  in "${STAGE3_SQL_EXTENSIONS[@]}";    do match+=( -o -iname "*.${e}" ); done
     for n  in "${STAGE3_EXACT_NAMES[@]}";   do match+=( -o -iname "$n" );     done
     for gp in "${STAGE3_GLOB_PATTERNS[@]}"; do match+=( -o -iname "$gp" );    done
     local name_expr=( '(' "${match[@]:1}" ')' )
@@ -2045,7 +2070,17 @@ find_high_value_files() {
                 if [ "${bn,,}" = "${k,,}" ]; then skip=1; break; fi
             done
             [ "$skip" -eq 1 ] && continue
-            record_interest "high_value_file" "$f"
+            local ext="${bn##*.}" tag=INTEREST category=high_value_file
+            ext="${ext,,}"
+            for e in "${STAGE3_OFFICE_EXTENSIONS[@]}"; do
+                if [ "$ext" = "$e" ]; then tag=OFFICE; category=office_document; break; fi
+            done
+            if [ "$tag" = INTEREST ]; then
+                for e in "${STAGE3_SQL_EXTENSIONS[@]}"; do
+                    if [ "$ext" = "$e" ]; then tag=SQL; category=sql_database_file; break; fi
+                done
+            fi
+            record_interest "$category" "$f" "$tag"
         done < <(find -H "$path" "${FIND_EXCLUDE_ARGS[@]}" -type f "${name_expr[@]}" -print0 2>/dev/null)
     done
 }
@@ -2328,10 +2363,10 @@ print_summary() {
     if [ -s "$INTEREST_FILE" ]; then
         print_section_header "Auxiliary credential-related files"
         sort -u "$INTEREST_FILE" -o "$INTEREST_FILE"
-        local cat path
-        while IFS=$'\t' read -r cat path; do
-            printf '  %b[INTEREST]%b %b%s%b  %s\n' "$C" "$NC" "$D" "$cat" "$NC" "$path"
-            log_line "[INTEREST] $cat  $path"
+        local tag cat path
+        while IFS=$'\t' read -r tag cat path; do
+            printf '  %b[%s]%b %b%s%b  %s\n' "$C" "$tag" "$NC" "$D" "$cat" "$NC" "$path"
+            log_line "[$tag] $cat  $path"
         done <"$INTEREST_FILE"
     fi
 
@@ -2380,11 +2415,13 @@ print_summary() {
     fi
 
     # Counts
-    local n_guar n_high n_key n_int n_name n_git n_env n_check n_skip
+    local n_guar n_high n_key n_int n_office n_sql n_name n_git n_env n_check n_skip
     n_guar=$( [ -s "$GUARANTEED_FILE" ] && wc -l <"$GUARANTEED_FILE" | tr -d ' ' || echo 0)
     n_high=$( [ -s "$HIGH_FILE" ]    && wc -l <"$HIGH_FILE"    | tr -d ' ' || echo 0)
     n_key=$(  [ -s "$KEY_FILE" ]     && wc -l <"$KEY_FILE"     | tr -d ' ' || echo 0)
-    n_int=$(  [ -s "$INTEREST_FILE" ]&& wc -l <"$INTEREST_FILE"| tr -d ' ' || echo 0)
+    n_office=$( [ -s "$INTEREST_FILE" ] && awk -F'\t' '$1=="OFFICE"{n++} END{print n+0}' "$INTEREST_FILE" || echo 0)
+    n_sql=$(    [ -s "$INTEREST_FILE" ] && awk -F'\t' '$1=="SQL"{n++} END{print n+0}' "$INTEREST_FILE" || echo 0)
+    n_int=$(    [ -s "$INTEREST_FILE" ] && awk -F'\t' '$1=="INTEREST"{n++} END{print n+0}' "$INTEREST_FILE" || echo 0)
     n_name=$( [ -s "$NAME_FILE" ]    && wc -l <"$NAME_FILE"    | tr -d ' ' || echo 0)
     n_git=$(  [ -s "$GIT_FILE" ]     && wc -l <"$GIT_FILE"     | tr -d ' ' || echo 0)
     n_env=$(  [ -s "$ENV_FINDINGS_FILE" ] && wc -l <"$ENV_FINDINGS_FILE" | tr -d ' ' || echo 0)
@@ -2395,6 +2432,8 @@ print_summary() {
     sum_row "$BOLD$R" "Confirmed credential containers $GWARN" "$n_guar"
     sum_row "$R"      "Reusable credentials"                   "$n_high"
     sum_row "$M"      "Private keys / auth material"           "$n_key"
+    sum_row "$B"      "Office documents"                       "$n_office"
+    sum_row "$C"      "SQL / database files"                   "$n_sql"
     sum_row "$C"      "Auxiliary credential-related files"     "$n_int"
     sum_row "$Y"      "Suspicious filenames (substring)"       "$n_name"
     sum_row "$B"      "Git repositories found"                  "$n_git"
@@ -2407,6 +2446,8 @@ print_summary() {
     log_line "  Confirmed credential containers: $n_guar"
     log_line "  Reusable credentials:            $n_high"
     log_line "  Private keys / material:         $n_key"
+    log_line "  Office documents:               $n_office"
+    log_line "  SQL / database files:           $n_sql"
     log_line "  Auxiliary credential-related:    $n_int"
     log_line "  Suspicious filenames (substring):$n_name"
     log_line "  Git repositories found:           $n_git"

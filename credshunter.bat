@@ -359,6 +359,8 @@ set /a nGuar=0
 set /a nHigh=0
 set /a nKey=0
 set /a nInt=0
+set /a nOffice=0
+set /a nSql=0
 set /a nName=0
 set /a nGit=0
 set /a nEnv=0
@@ -1212,6 +1214,16 @@ goto :EOF
 
 :DoStage3
 if not defined QUIET echo !CB![*] Stage 3 - High-value file types!CNC!
+for /f "delims=" %%F in ('type "%FILELIST%" ^| findstr /I /E "\.doc \.docx \.docm \.dot \.dotx \.dotm \.xls \.xlsx \.xlsm \.xlsb \.xlt \.xltx \.xltm \.ppt \.pptx \.pptm \.pot \.potx \.potm \.pps \.ppsx \.ppsm \.vsd \.vsdx \.pub \.mdb \.accdb"') do (
+    call :AddInterest "office_document" "%%~F" "OFFICE"
+)
+for /f "delims=" %%F in ('type "%FILELIST%" ^| findstr /I /E "\.sql \.ddl \.dump \.psql \.pgsql \.plsql \.tsql \.mdf \.ndf \.ldf"') do (
+    set "skipSqlDb="
+    for %%D in (master.mdf mastlog.ldf model.mdf modellog.ldf msdb.mdf msdbdata.mdf msdblog.ldf tempdb.mdf templog.ldf mssqlsystemresource.mdf mssqlsystemresource.ldf model_msdbdata.mdf model_msdblog.ldf model_replicatedmaster.mdf model_replicatedmaster.ldf) do (
+        if /I "%%~nxF"=="%%D" set "skipSqlDb=1"
+    )
+    if not defined skipSqlDb call :AddInterest "sql_database_file" "%%~F" "SQL"
+)
 for /f "delims=" %%F in ('type "%FILELIST%" ^| findstr /I /E "\.pem \.key \.priv \.crt \.cer \.csr \.env \.envrc \.keytab \.sh \.bash \.bak \.old \.orig \.backup \.swp \.save \.db \.sqlite \.sqlite3 \.log \.pcap \.pcapng \.tar \.tgz \.gz \.zip \.7z"') do (
     call :AddInterest "high_value_file" "%%~F"
 )
@@ -1911,14 +1923,23 @@ goto :EOF
 :AddInterest
 set "iCat=%~1"
 set "iPath=%~2"
-set "iKey=[INTEREST] !iCat! !iPath!"
+set "iTag=%~3"
+if not defined iTag set "iTag=INTEREST"
+if /I not "!iTag!"=="INTEREST" if /I not "!iTag!"=="OFFICE" if /I not "!iTag!"=="SQL" set "iTag=INTEREST"
+set "iKey=[!iTag!] !iCat! !iPath!"
 findstr /X /C:"!iKey!" "%DEDUP%" >nul 2>&1
 if !errorlevel!==0 goto :EOF
 echo !iKey! >> "%DEDUP%"
 echo !iKey! >> "%INTEREST%"
-if not defined QUIET echo   !CC![INTEREST]!CNC! !CD!!iCat!!CNC!  !iPath!
-if defined OUTPUTFILE echo [INTEREST] !iCat!  !iPath! >> "%OUTPUTFILE%"
-set /a nInt+=1
+if not defined QUIET echo   !CC![!iTag!]!CNC! !CD!!iCat!!CNC!  !iPath!
+if defined OUTPUTFILE echo [!iTag!] !iCat!  !iPath! >> "%OUTPUTFILE%"
+if /I "!iTag!"=="OFFICE" (
+    set /a nOffice+=1
+) else if /I "!iTag!"=="SQL" (
+    set /a nSql+=1
+) else (
+    set /a nInt+=1
+)
 goto :EOF
 
 :AddName
@@ -1977,6 +1998,7 @@ if !errorlevel!==0 (
 goto :EOF
 
 :WriteSummary
+set /a nInterestTotal=nInt+nOffice+nSql
 if not defined QUIET (
     echo.
     echo   !CC!==== SUMMARY =====================================================!CNC!
@@ -2014,7 +2036,7 @@ if %nKey% GTR 0 (
         if defined OUTPUTFILE echo %%a >> "%OUTPUTFILE%"
     )
 )
-if %nInt% GTR 0 (
+if %nInterestTotal% GTR 0 (
     if not defined QUIET (
         echo.
         echo   !CW!^> Auxiliary credential-related files!CNC!
@@ -2078,6 +2100,8 @@ if not defined QUIET (
     echo   !CR!Confirmed credential containers ............ %nGuar%!CNC!
     echo   !CR!Reusable credentials ........................ %nHigh%!CNC!
     echo   !CM!Private keys / auth material ............... %nKey%!CNC!
+    echo   !CB!Office documents ........................... %nOffice%!CNC!
+    echo   !CC!SQL / database files ....................... %nSql%!CNC!
     echo   !CC!Auxiliary credential-related files .......... %nInt%!CNC!
     echo   !CY!Suspicious filenames ^(substring^) ............ %nName%!CNC!
     echo   !CB!Git repositories found ...................... %nGit%!CNC!
@@ -2091,6 +2115,8 @@ if defined OUTPUTFILE (
     echo   Confirmed credential containers: %nGuar% >> "%OUTPUTFILE%"
     echo   Reusable credentials:            %nHigh% >> "%OUTPUTFILE%"
     echo   Private keys / material:         %nKey% >> "%OUTPUTFILE%"
+    echo   Office documents:               %nOffice% >> "%OUTPUTFILE%"
+    echo   SQL / database files:           %nSql% >> "%OUTPUTFILE%"
     echo   Auxiliary credential-related:    %nInt% >> "%OUTPUTFILE%"
     echo   Suspicious filenames:            %nName% >> "%OUTPUTFILE%"
     echo   Git repositories found:           %nGit% >> "%OUTPUTFILE%"

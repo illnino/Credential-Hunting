@@ -812,6 +812,20 @@ $script:Stage3Extensions = @(
     '.tar','.tgz','.gz','.zip','.7z'
 )
 
+# Office documents and SQL/database artifacts are reported by default in
+# Stage 3, but their contents are not read unless a separate Stage 5 rule
+# selects them (SQL text formats remain opt-in via -IncludeData).
+$script:Stage3OfficeExtensions = @(
+    '.doc','.docx','.docm','.dot','.dotx','.dotm'
+    '.xls','.xlsx','.xlsm','.xlsb','.xlt','.xltx','.xltm'
+    '.ppt','.pptx','.pptm','.pot','.potx','.potm','.pps','.ppsx','.ppsm'
+    '.vsd','.vsdx','.pub','.mdb','.accdb'
+)
+$script:Stage3SqlExtensions = @(
+    '.sql','.ddl','.dump','.psql','.pgsql','.plsql','.tsql'
+    '.mdf','.ndf','.ldf'
+)
+
 # Exact filename matches (names that cannot be expressed as a simple *.ext glob)
 $script:Stage3ExactNames = @(
     'krb5.conf'
@@ -917,6 +931,10 @@ $script:Stage2ExtensionsSet = [System.Collections.Generic.HashSet[string]]::new(
     [string[]]$script:Stage2Extensions, [System.StringComparer]::OrdinalIgnoreCase)
 $script:Stage3ExtensionsSet = [System.Collections.Generic.HashSet[string]]::new(
     [string[]]$script:Stage3Extensions, [System.StringComparer]::OrdinalIgnoreCase)
+$script:Stage3OfficeExtensionsSet = [System.Collections.Generic.HashSet[string]]::new(
+    [string[]]$script:Stage3OfficeExtensions, [System.StringComparer]::OrdinalIgnoreCase)
+$script:Stage3SqlExtensionsSet = [System.Collections.Generic.HashSet[string]]::new(
+    [string[]]$script:Stage3SqlExtensions, [System.StringComparer]::OrdinalIgnoreCase)
 $script:Stage3GlobPatternsLower = @($script:Stage3GlobPatterns | ForEach-Object { $_.ToLowerInvariant() })
 
 # Fast filename-based skip for cred-free files that match a credential
@@ -1321,7 +1339,7 @@ function End-Stage { param([int]$N, [string]$Title)
         }
         if ($dInt -gt 0) {
             $script:Interesting | Select-Object -Last $dInt | ForEach-Object {
-                Write-Host ("  [{0,-8}]  {1}" -f 'INTEREST', $_.Path)
+                Write-Host ("  [{0,-8}]  {1}" -f $_.Tag, $_.Path)
             }
         }
         if ($dName -gt 0) {
@@ -1515,10 +1533,14 @@ function Add-Finding {
     }
 }
 
-function Add-Interesting { param([string]$Category, [string]$Path)
+function Add-Interesting { param([string]$Category, [string]$Path, [string]$Tag = 'INTEREST')
+    $normalizedTag = if ($Tag) { $Tag.ToUpperInvariant() } else { 'INTEREST' }
+    if ($normalizedTag -notin @('INTEREST','OFFICE','SQL')) { $normalizedTag = 'INTEREST' }
     $k = "$Category|$Path"
     if ($script:InterestingHashes.Add($k)) {
-        $script:Interesting.Add([PSCustomObject]@{ Category = $Category; Path = $Path })
+        $script:Interesting.Add([PSCustomObject]@{
+            Tag = $normalizedTag; Category = $Category; Path = $Path
+        })
         if ($script:InStage1) {
             Write-Stage1Finding -Tier 'Interest' -Label $Category -Path $Path
         }
@@ -3012,6 +3034,18 @@ function Find-HighValueFiles { param($Files)
         # Stage3ExactNamesSet are OrdinalIgnoreCase, so the lowercased Name works.
         if ($script:SkipDbFilenames.Contains($f.Name)) { continue }
 
+        # Office and SQL files get dedicated display tags, but remain path-only
+        # Stage 3 discoveries. Classification is exclusive and precedes the
+        # generic high-value rules.
+        if ($script:Stage3OfficeExtensionsSet.Contains($f.Ext)) {
+            Add-Interesting -Category 'office_document' -Path $f.Path -Tag 'OFFICE'
+            continue
+        }
+        if ($script:Stage3SqlExtensionsSet.Contains($f.Ext)) {
+            Add-Interesting -Category 'sql_database_file' -Path $f.Path -Tag 'SQL'
+            continue
+        }
+
         $matched = $false
         # Pass 1: extension
         if ($script:Stage3ExtensionsSet.Contains($f.Ext)) { $matched = $true }
@@ -3206,8 +3240,8 @@ function Write-FullSummary {
         Write-LogLine ""
         Write-LogLine "=== Auxiliary credential-related files ==="
         foreach ($i in $script:Interesting | Sort-Object Category, Path) {
-            Write-Host ("  $($script:CC)[INTEREST]$($script:CNC) $($script:CD)$($i.Category)$($script:CNC)  $($i.Path)")
-            Write-LogLine ("[INTEREST] $($i.Category)  $($i.Path)")
+            Write-Host ("  $($script:CC)[$($i.Tag)]$($script:CNC) $($script:CD)$($i.Category)$($script:CNC)  $($i.Path)")
+            Write-LogLine ("[$($i.Tag)] $($i.Category)  $($i.Path)")
         }
     }
     } catch { Write-Warn ("summary section error (Auxiliary credential-related files): " + $_.Exception.Message) }
@@ -3269,7 +3303,9 @@ function Write-FullSummary {
     $nGuar  = $script:Guaranteed.Count
     $nHigh  = $script:HighFindings.Count
     $nKey   = $script:KeyFindings.Count
-    $nInt   = $script:Interesting.Count
+    $nOffice = @($script:Interesting | Where-Object { $_.Tag -eq 'OFFICE' }).Count
+    $nSql    = @($script:Interesting | Where-Object { $_.Tag -eq 'SQL' }).Count
+    $nInt    = @($script:Interesting | Where-Object { $_.Tag -eq 'INTEREST' }).Count
     $nName  = $script:SuspiciousNamesFound.Count
     $nGit   = $script:GitRepositories.Count
     $nEnv   = $script:EnvironmentFindingNames.Count
@@ -3278,6 +3314,8 @@ function Write-FullSummary {
     Write-SummaryRow ($script:CBold + $script:CR) ("Confirmed credential containers " + $script:GWarn) $nGuar
     Write-SummaryRow $script:CR "Reusable credentials"               $nHigh
     Write-SummaryRow $script:CM "Private keys / auth material"        $nKey
+    Write-SummaryRow $script:CB "Office documents"                    $nOffice
+    Write-SummaryRow $script:CC "SQL / database files"                $nSql
     Write-SummaryRow $script:CC "Auxiliary credential-related files"  $nInt
     Write-SummaryRow $script:CY "Suspicious filenames (substring)"    $nName
     Write-SummaryRow $script:CB "Git repositories found"                $nGit
@@ -3290,6 +3328,8 @@ function Write-FullSummary {
     Write-LogLine "  Confirmed credential containers: $nGuar"
     Write-LogLine "  Reusable credentials:            $nHigh"
     Write-LogLine "  Private keys / material:         $nKey"
+    Write-LogLine "  Office documents:               $nOffice"
+    Write-LogLine "  SQL / database files:           $nSql"
     Write-LogLine "  Auxiliary credential-related:    $nInt"
     Write-LogLine "  Suspicious filenames (substring):$nName"
     Write-LogLine "  Git repositories found:           $nGit"
