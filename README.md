@@ -21,7 +21,10 @@
 
 ## Overview
 
-`CredsHunter` is a **read-only credential discovery toolkit** for authorized internal penetration testing and post-exploitation.
+This repository provides two complementary **read-only credential discovery workflows** for authorized internal penetration testing and post-exploitation:
+
+- **CredsHunter** performs a staged, low-noise scan of known credential locations, selected file types, filenames, content, Git repositories, and the scanner environment.
+- **HomeHunter** searches user home/profile directories for easily missed clues. It enumerates every encountered file and applies CredsHunter-style credential rules to every readable file that can be treated as text, regardless of its name or extension.
 
 It searches Linux and Windows hosts for credential material that is realistically useful during an engagement: plaintext passwords, database connection strings, private keys, credential containers, reusable hashes, shell-history credentials, GPP `cpassword` values, unattended-install credentials, and other high-value local artifacts.
 
@@ -81,6 +84,58 @@ cd Credential-Hunting
 ```
 
 > Elevated execution is recommended when you want access to protected credential locations such as SAM / SYSTEM hives, vault directories, or other privileged stores.
+
+---
+
+## HomeHunter
+
+HomeHunter is the focused companion scanner for user home/profile directories. It is intended for cases where a clue may be stored under an unexpected or hidden name such as `.~`, rather than a recognized Stage 5 extension.
+
+No arguments are required. By default, each implementation discovers all user homes/profiles it can identify, scans those it can read, and continues past inaccessible locations while reporting `[DENIED]` entries.
+
+### Linux
+
+```bash
+chmod +x homehunter.sh
+./homehunter.sh
+
+# Recommended when you are authorized to inspect every user's home
+sudo ./homehunter.sh
+
+# Optional: raise the text-scan limit and save a log
+sudo ./homehunter.sh --max-size 20 --output home-loot.txt
+```
+
+### Windows PowerShell
+
+```powershell
+.\homehunter.ps1
+
+# Optional: raise the text-scan limit and save a log
+.\homehunter.ps1 -MaxFileSizeMB 20 -OutputFile home-loot.txt
+```
+
+### Windows CMD
+
+```bat
+homehunter.cmd
+homehunter.cmd -MaxFileSizeMB 20 -OutputFile home-loot.txt
+```
+
+Use an elevated shell for the widest coverage. Without elevation, HomeHunter does not abort when another user's profile is inaccessible; it records the denied path and continues.
+
+| Goal | Linux | PowerShell / CMD |
+|---|---|---|
+| Add an explicit home | `--home PATH` | `-Home PATH` |
+| Scan only explicitly supplied homes | `--only-specified-homes` | `-OnlySpecifiedHomes` |
+| Change text-scan size cap | `--max-size N` | `-MaxFileSizeMB N` |
+| Write findings to a file | `--output FILE` | `-OutputFile FILE` |
+| Reduce progress output | `--quiet` | `-Quiet` |
+| Disable ANSI colors | `--no-color` | `-NoColor` |
+
+The default text-scan limit is **5 MiB**. Larger files are still inventoried as `[SKIP:size>5MB]`; binary files are reported as `[SKIP:binary]`. Symlinks and Windows reparse points are not followed.
+
+> **Plaintext warning:** HomeHunter output can contain matched passwords, keys, connection strings, and other secrets. Treat console captures and output logs as credential material.
 
 ---
 
@@ -176,6 +231,20 @@ Results are grouped by usefulness and confidence, with the most important findin
 
 A sensitive result in **CRITICAL**, **HIGH**, or **KEY** causes a non-zero sensitive-findings exit status. `INTEREST` and `NAME` findings alone do not.
 
+HomeHunter also uses these inventory and classification tags:
+
+| Tag | Meaning |
+|---|---|
+| `[HIDDEN]` | Hidden item, including a Unix basename beginning with `.` or a Windows Hidden/System item |
+| `[OFFICE]` | Microsoft Office file worth manual review |
+| `[SQL]` | SQL script, dump, or database-related file |
+| `[ARCHIVE]` | Archive or compressed file worth manual review |
+| `[SKIP:size>NMB]` | File was inventoried but its content exceeded the configured text-scan limit |
+| `[SKIP:binary]` | File was inventoried but not content-scanned because it appeared binary |
+| `[DENIED]` | A path could not be read with the current user's permissions |
+
+`[HIGH]` and `[KEY]` retain their credential meanings in HomeHunter. Classification tags such as `[HIDDEN]`, `[OFFICE]`, and `[SQL]` identify files for review and do not by themselves claim that a credential was found.
+
 For example:
 
 ```bash
@@ -230,9 +299,10 @@ Edit the relevant list in one place; the scanning workflow does not need to be r
 
 | Platform | Requirements |
 |---|---|
-| **Linux** | Bash 4+, `find`, `grep`, `awk`, `sed`, `stat` |
-| **Linux — optional** | `realpath`, `file` |
+| **Linux** | Bash 4+, `find`, `grep`, `awk`, `sed`, `stat`, `od` |
+| **Linux — optional** | `realpath`, `file`, `iconv` (UTF-16 decoding) |
 | **Windows** | PowerShell 5.1+ |
+| **Windows CMD** | Native `cmd.exe` tools including `dir`, `findstr`, `reg`, and `icacls` |
 | **Privileges** | Elevated execution is optional, but increases visibility into protected credential locations |
 
 The Linux implementation is designed for common distributions including Debian/Ubuntu, RHEL-family systems, Arch, and Alpine.
@@ -246,6 +316,14 @@ The Linux implementation is designed for common distributions including Debian/U
 <br>
 
 No. The scanner is read-only. It writes only to the output file you explicitly choose, does not transmit findings over the network, and cleans up its temporary working data on exit.
+
+</details>
+
+<details>
+<summary><strong>Why did CredsHunter miss a hidden or extensionless home-directory file?</strong></summary>
+<br>
+
+CredsHunter Stage 5 uses a targeted file-type allow-list by default to reduce noise and scan time. Use `--all` on Linux or `-All` on Windows for a broader CredsHunter content scan, or run HomeHunter when the objective is to inspect user homes comprehensively. HomeHunter reports hidden items such as `.~` and scans every readable file that can be treated as text, regardless of its name or extension.
 
 </details>
 
