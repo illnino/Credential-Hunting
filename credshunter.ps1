@@ -1517,9 +1517,10 @@ function Add-Finding {
         [string]$Label,
         [string]$Path,
         [int]   $LineNumber,
-        [string]$Preview
+        [string]$Preview,
+        [string]$DedupDetail = ''
     )
-    $key = "$Bucket|$Label|$Path|$LineNumber"
+    $key = "$Bucket|$Label|$Path|$LineNumber|$DedupDetail"
     if (-not $script:FindingHashes.Add($key)) { return }
     $obj = [PSCustomObject]@{
         Label = $Label; Path = $Path; LineNumber = $LineNumber; Preview = $Preview
@@ -1580,6 +1581,254 @@ function Add-Checked { param([string]$Label, [string]$Path)
 }
 function Add-Skipped { param([string]$Path, [string]$Reason)
     $script:SkippedFiles.Add([PSCustomObject]@{ Path = $Path; Reason = $Reason })
+}
+
+# ============================================================================
+#  Generic SQL credential extraction
+# ============================================================================
+
+# SQL dumps often separate a credential-bearing column/property name from its
+# value, or omit INSERT column names after declaring them in CREATE TABLE. The
+# normal line-oriented rules cannot infer those relationships. This bounded,
+# read-only parser supplements them; it never executes SQL.
+$script:SqlMaxStatementChars = 65536
+$script:SqlMaxStatementLines = 200
+
+function ConvertTo-SqlIdentifier { param([string]$Name)
+    if ($null -eq $Name) { return '' }
+    $n = $Name.Trim().Replace('[','').Replace(']','').Replace('`','').Replace('"','').ToLowerInvariant()
+    $n = [regex]::Replace($n, '[^a-z0-9_]', '_')
+    $n = [regex]::Replace($n, '_+', '_')
+    return $n.Trim('_')
+}
+
+function Test-SqlCredentialName { param([string]$Name)
+    $n = ConvertTo-SqlIdentifier $Name
+    if ($n -match '^(password|passwd|passphrase|pwd|secret|credentials?|digest|plainpassword|encryptedpassword|storedkey|serverkey|passwordkey|passwordhash|passwdhash|pwhash)$') { return $true }
+    return $n -match '_(password|passwd|passphrase|pwd|secret|credentials?|digest|plainpassword|encryptedpassword|storedkey|serverkey|passwordkey|passwordhash|passwdhash|pwhash)$'
+}
+
+function Split-SqlCsv { param([string]$Text)
+    $tokens = New-Object 'System.Collections.Generic.List[string]'
+    $token = New-Object System.Text.StringBuilder
+    $inQuote = $false
+    $depth = 0
+    for ($i = 0; $i -lt $Text.Length; $i++) {
+        $ch = $Text[$i]
+        if ($ch -eq "'") {
+            if ($inQuote -and $i + 1 -lt $Text.Length -and $Text[$i + 1] -eq "'") {
+                [void]$token.Append("''"); $i++; continue
+            }
+            $inQuote = -not $inQuote
+            [void]$token.Append($ch)
+            continue
+        }
+        if (-not $inQuote) {
+            if ($ch -eq '(') { $depth++ }
+            elseif ($ch -eq ')' -and $depth -gt 0) { $depth-- }
+            elseif ($ch -eq ',' -and $depth -eq 0) {
+                [void]$tokens.Add($token.ToString().Trim())
+                [void]$token.Clear()
+                continue
+            }
+        }
+        [void]$token.Append($ch)
+    }
+    if ($inQuote) { return [PSCustomObject]@{ Valid = $false; Tokens = @() } }
+    [void]$tokens.Add($token.ToString().Trim())
+    return [PSCustomObject]@{ Valid = $true; Tokens = $tokens.ToArray() }
+}
+
+function ConvertFrom-SqlLiteral { param([string]$Token)
+    $m = [regex]::Match($Token.Trim(), "(?s)^[nNeE]?'(.*)'$")
+    if (-not $m.Success) { return [PSCustomObject]@{ IsLiteral = $false; Value = $Token.Trim() } }
+    return [PSCustomObject]@{ IsLiteral = $true; Value = $m.Groups[1].Value.Replace("''", "'") }
+}
+
+function Test-SqlLikeContent { param([string]$Path, [string]$Content)
+    $ext = [System.IO.Path]::GetExtension($Path).TrimStart('.').ToLowerInvariant()
+    if ($ext -in @('sql','ddl','dump','psql','pgsql','plsql','tsql','cql','sqlproj')) { return $true }
+    if ($ext -notin @('script','txt','text','bak','backup','old','log')) { return $false }
+    return [regex]::IsMatch($Content,
+        '(?im)^\s*(?:CREATE(?:\s+(?:GLOBAL|LOCAL|MEMORY|CACHED|TEMP|TEMPORARY|UNLOGGED))?\s+(?:TABLE|USER|LOGIN|ROLE)|ALTER\s+(?:USER|LOGIN|ROLE|TABLE)|INSERT\s+INTO|SET\s+(?:DATABASE|PASSWORD)|COPY\s+)')
+}
+
+function Add-SqlCredentialFinding {
+    param([string]$Label, [string]$Path, [int]$LineNumber, [string]$Field, [string]$Value)
+    $valueText = $Value.Trim()
+    if (-not $valueText -or (Test-FalsePositive -Value $valueText)) { return }
+    $key = '{0}|{1}|{2}|{3}' -f $Path, $LineNumber, $Field.ToLowerInvariant(), $valueText
+    if (-not $script:SqlReported.Add($key)) { return }
+
+    # If the ordinary line pass already reported this exact value on the same
+    # line, retain that result rather than adding a second SQL label.
+    foreach ($finding in $script:HighFindings) {
+        if ($finding.Path -eq $Path -and $finding.LineNumber -eq $LineNumber -and
+            $finding.Preview.IndexOf($valueText, [System.StringComparison]::Ordinal) -ge 0) { return }
+    }
+    Add-Finding -Bucket High -Label "content/$Label" -Path $Path `
+        -LineNumber $LineNumber -Preview (Format-Preview ("{0}={1}" -f $Field, $valueText)) `
+        -DedupDetail ("{0}|{1}" -f $Field.ToLowerInvariant(), $valueText)
+}
+
+function Save-SqlCreateTable { param([string]$Statement)
+    $m = [regex]::Match($Statement,
+        '(?is)^\s*CREATE\s+(?:(?:GLOBAL|LOCAL|MEMORY|CACHED|TEMP|TEMPORARY|UNLOGGED)\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?<table>[^\s(]+)\s*\((?<columns>.*)\)\s*$')
+    if (-not $m.Success) { return }
+    $split = Split-SqlCsv $m.Groups['columns'].Value
+    if (-not $split.Valid) { return }
+    $columns = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($entry in $split.Tokens) {
+        $first = ($entry.Trim() -split '\s+', 2)[0]
+        $column = ConvertTo-SqlIdentifier $first
+        if (-not $column -or $column -in @('constraint','primary','unique','foreign','check','key')) { continue }
+        [void]$columns.Add($column)
+    }
+    if ($columns.Count -eq 0) { return }
+    $rawTable = $m.Groups['table'].Value
+    $table = ConvertTo-SqlIdentifier $rawTable
+    if ($table) { $script:SqlTableColumns[$table] = $columns.ToArray() }
+    $parts = $rawTable -split '\.'
+    $base = ConvertTo-SqlIdentifier $parts[$parts.Count - 1]
+    if ($base) { $script:SqlTableColumns[$base] = $columns.ToArray() }
+}
+
+function Find-SqlPropertyCredentials {
+    param([string]$Statement, [string]$Path, [int]$LineNumber)
+    $m = [regex]::Match($Statement, '(?is)\bVALUES\s*\((?<values>.*)\)\s*$')
+    if (-not $m.Success) { return }
+    $split = Split-SqlCsv $m.Groups['values'].Value
+    if (-not $split.Valid) { return }
+    $values = @($split.Tokens)
+    for ($i = 0; $i + 1 -lt $values.Count; $i++) {
+        $key = ConvertFrom-SqlLiteral $values[$i]
+        if (-not $key.IsLiteral -or -not (Test-SqlCredentialName $key.Value)) { continue }
+        $value = ConvertFrom-SqlLiteral $values[$i + 1]
+        if (-not $value.IsLiteral) { continue }
+        Add-SqlCredentialFinding -Label 'sql_property_credential' -Path $Path `
+            -LineNumber $LineNumber -Field $key.Value -Value $value.Value
+    }
+}
+
+function Find-SqlDdlCredential {
+    param([string]$Statement, [string]$Path, [int]$LineNumber)
+    $value = $null
+    $field = 'sql_password'
+    if ($Statement -match '(?is)^\s*SET\s+PASSWORD(?:\s+FOR\s+[^=\s]+)?\s*=\s*PASSWORD\s*\(\s*[nNeE]?''(?<value>[^'']+)''\s*\)') {
+        $value = $Matches['value']; $field = 'set_password'
+    } elseif ($Statement -match '(?is)^\s*SET\s+PASSWORD(?:\s+FOR\s+[^=\s]+)?\s*=\s*[nNeE]?''(?<value>[^'']+)''') {
+        $value = $Matches['value']; $field = 'set_password'
+    } elseif ($Statement -match '(?is)^\s*(?:CREATE|ALTER)\s+(?:USER|LOGIN|ROLE)\s+') {
+        if ($Statement -match '(?is)\bPASSWORD\s+DIGEST\s*=?\s*[nNeE]?''(?<value>[^'']+)''') {
+            $value = $Matches['value']; $field = 'password_digest'
+        } elseif ($Statement -match '(?is)\bIDENTIFIED\s+(?:WITH\s+\S+\s+)?BY\s+[nNeE]?''(?<value>[^'']+)''') {
+            $value = $Matches['value']; $field = 'identified_by'
+        } elseif ($Statement -match '(?is)\b(?:WITH\s+)?PASSWORD\s*=\s*[nNeE]?''(?<value>[^'']+)''') {
+            $value = $Matches['value']
+        } elseif ($Statement -match '(?is)\b(?:WITH\s+)?PASSWORD\s+[nNeE]?''(?<value>[^'']+)''') {
+            $value = $Matches['value']
+        }
+    }
+    if ($null -ne $value) {
+        Add-SqlCredentialFinding -Label 'sql_ddl_password' -Path $Path `
+            -LineNumber $LineNumber -Field $field -Value $value
+    }
+}
+
+function Find-SqlInsertCredentials {
+    param([string]$Statement, [string]$Path, [int]$LineNumber)
+    $m = [regex]::Match($Statement,
+        '(?is)^\s*INSERT\s+INTO\s+(?<table>[^\s(]+)\s*(?:\((?<columns>[^)]*)\))?\s+VALUES\s*\((?<values>.*)\)\s*$')
+    if (-not $m.Success) { return }
+    $columns = @()
+    if ($m.Groups['columns'].Success) {
+        $columnSplit = Split-SqlCsv $m.Groups['columns'].Value
+        if (-not $columnSplit.Valid) { return }
+        $columns = @($columnSplit.Tokens | ForEach-Object { ConvertTo-SqlIdentifier $_ })
+    } else {
+        $table = ConvertTo-SqlIdentifier $m.Groups['table'].Value
+        if (-not $script:SqlTableColumns.ContainsKey($table)) {
+            $parts = $m.Groups['table'].Value -split '\.'
+            $table = ConvertTo-SqlIdentifier $parts[$parts.Count - 1]
+        }
+        if (-not $script:SqlTableColumns.ContainsKey($table)) { return }
+        $columns = @($script:SqlTableColumns[$table])
+    }
+    $valueSplit = Split-SqlCsv $m.Groups['values'].Value
+    if (-not $valueSplit.Valid) { return }
+    $values = @($valueSplit.Tokens)
+    if ($columns.Count -ne $values.Count) { return }
+    for ($i = 0; $i -lt $columns.Count; $i++) {
+        if (-not (Test-SqlCredentialName $columns[$i])) { continue }
+        $literal = ConvertFrom-SqlLiteral $values[$i]
+        if (-not $literal.IsLiteral) { continue }
+        Add-SqlCredentialFinding -Label 'sql_insert_credential' -Path $Path `
+            -LineNumber $LineNumber -Field $columns[$i] -Value $literal.Value
+    }
+}
+
+function Invoke-SqlStatement {
+    param([string]$Statement, [string]$Path, [int]$LineNumber)
+    $stmt = $Statement.Trim()
+    if (-not $stmt -or $stmt -match '^(--|#|/\*)') { return }
+    Save-SqlCreateTable $stmt
+    Find-SqlDdlCredential -Statement $stmt -Path $Path -LineNumber $LineNumber
+    Find-SqlPropertyCredentials -Statement $stmt -Path $Path -LineNumber $LineNumber
+    Find-SqlInsertCredentials -Statement $stmt -Path $Path -LineNumber $LineNumber
+}
+
+function Invoke-SqlContentScan { param([string]$Path, [string]$Content)
+    $script:SqlTableColumns = [System.Collections.Generic.Dictionary[string,object]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $script:SqlReported = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+    $statement = New-Object System.Text.StringBuilder
+    $reader = New-Object System.IO.StringReader($Content)
+    $inQuote = $false
+    $dropping = $false
+    $limitReported = $false
+    $lineNumber = 0
+    $startLine = 1
+    $statementLines = 0
+    try {
+        while ($null -ne ($line = $reader.ReadLine())) {
+            $lineNumber++
+            if (($statement.Length -gt 0 -or $dropping) -and -not $inQuote -and
+                $line -match '^\s*(?:CREATE|ALTER|INSERT|SET|GRANT|COPY|UPDATE|DELETE|DROP|MERGE)\s+') {
+                if (-not $dropping) { Invoke-SqlStatement -Statement $statement.ToString() -Path $Path -LineNumber $startLine }
+                [void]$statement.Clear(); $statementLines = 0; $dropping = $false
+            }
+            if ($statement.Length -eq 0 -and -not $dropping) { $startLine = $lineNumber }
+            $statementLines++
+            for ($i = 0; $i -lt $line.Length; $i++) {
+                $ch = $line[$i]
+                if ($ch -eq "'") {
+                    if ($inQuote -and $i + 1 -lt $line.Length -and $line[$i + 1] -eq "'") {
+                        if (-not $dropping) { [void]$statement.Append("''") }
+                        $i++; continue
+                    }
+                    $inQuote = -not $inQuote
+                }
+                if (-not $dropping) { [void]$statement.Append($ch) }
+                if (-not $inQuote -and $ch -eq ';') {
+                    if (-not $dropping) {
+                        $statement.Length--
+                        Invoke-SqlStatement -Statement $statement.ToString() -Path $Path -LineNumber $startLine
+                    }
+                    [void]$statement.Clear(); $statementLines = 0; $dropping = $false; $startLine = $lineNumber
+                } elseif (-not $dropping -and
+                    ($statement.Length -gt $script:SqlMaxStatementChars -or $statementLines -gt $script:SqlMaxStatementLines)) {
+                    if (-not $limitReported) {
+                        Add-Skipped -Path $Path -Reason ("SQL statement exceeds parser limit (line {0})" -f $startLine)
+                        $limitReported = $true
+                    }
+                    $dropping = $true; [void]$statement.Clear()
+                }
+            }
+            if ($statement.Length -gt 0) { [void]$statement.Append("`n") }
+        }
+    } finally { $reader.Dispose() }
+    if (-not $dropping -and -not $inQuote -and $statement.Length -gt 0) {
+        Invoke-SqlStatement -Statement $statement.ToString() -Path $Path -LineNumber $startLine
+    }
 }
 
 # ============================================================================
@@ -1654,6 +1903,8 @@ function Invoke-ScanFile { param([string]$FullPath, [string]$SourceLabel = 'cont
     if ($null -eq $content) { Add-Skipped -Path $FullPath -Reason 'binary'; return }
     if ([string]::IsNullOrEmpty($content)) { return }
 
+    $scanAsSql = Test-SqlLikeContent -Path $FullPath -Content $content
+
     # ---- Private-key markers (format-anchored) ------------------------------
     # ~99% of files contain no key header, so gate the 8 whole-file regex passes
     # behind a cheap Ordinal substring check. This canNOT run after the keyword
@@ -1690,7 +1941,10 @@ function Invoke-ScanFile { param([string]$FullPath, [string]$SourceLabel = 'cont
     }
 
     # ---- Pre-filter: if no anchor keyword, skip the expensive pass ----------
-    if (-not $script:KeywordPrefilter.IsMatch($content)) { return }
+    if (-not $script:KeywordPrefilter.IsMatch($content)) {
+        if ($scanAsSql) { Invoke-SqlContentScan -Path $FullPath -Content $content }
+        return
+    }
 
     # ---- Line-by-line credential-pattern scan -------------------------------
     $matchesFound = 0
@@ -1827,6 +2081,8 @@ function Invoke-ScanFile { param([string]$FullPath, [string]$SourceLabel = 'cont
         }
         }
     } finally { $reader.Dispose() }
+
+    if ($scanAsSql) { Invoke-SqlContentScan -Path $FullPath -Content $content }
 }
 
 # Classify one logical NAME=VALUE assignment with the same compiled patterns,

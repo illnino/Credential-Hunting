@@ -113,6 +113,12 @@ MAX_LINE_LEN=16384
 # files where thousands of lines match the prefilter but are all false
 # positives, so a genuine credential after them is still reached and reported.
 PREFILTER_LINE_CAP=5000
+# SQL-aware Stage 5 pass. SQL dumps can use multi-line statements and positional
+# INSERT rows, so line-oriented password=value regexes are not sufficient.
+# Keep the parser deliberately bounded: it is a credential extractor, not a SQL
+# engine, and must remain safe on malformed or attacker-controlled dumps.
+SQL_MAX_STATEMENT_BYTES=65536
+SQL_MAX_STATEMENT_LINES=200
 
 # Stage-1 live-output state. When IN_STAGE1=1, the record_* helpers stream
 # each finding to stderr as it's discovered so the operator sees results in
@@ -141,6 +147,8 @@ touch "$HIGH_FILE" "$KEY_FILE" "$NAME_FILE" "$GIT_FILE" \
 
 declare -A SCANNED_PATHS   # canonical path -> 1, dedup across all stages
 declare -A GIT_MARKERS     # canonical .git marker path -> 1
+declare -A SQL_TABLE_COLUMNS # normalized table -> unit-separated column names
+declare -A SQL_REPORTED      # per-file SQL finding dedup
 
 # ----------------------------------------------------------------------------
 #  Signal handling — Ctrl+C / SIGTERM exits immediately
@@ -1408,6 +1416,308 @@ classify_line() {
     return 1
 }
 
+# ── Generic SQL credential extraction ─────────────────────────────────────
+# SQL dumps frequently separate a credential-bearing column/property name from
+# its value with commas, or omit column names from INSERT rows entirely after a
+# CREATE TABLE declaration. The normal line regex pass cannot infer those
+# relationships. These helpers add a bounded, read-only SQL-aware pass without
+# implementing or executing a full SQL grammar.
+
+sql_trim() {
+    REPLY="$1"
+    REPLY="${REPLY#"${REPLY%%[![:space:]]*}"}"
+    REPLY="${REPLY%"${REPLY##*[![:space:]]}"}"
+}
+
+sql_normalize_identifier() {
+    local n="$1"
+    sql_trim "$n"; n="$REPLY"
+    n="${n//\[/}"; n="${n//\]/}"; n="${n//\`/}"; n="${n//\"/}"
+    n="${n,,}"
+    # Punctuation separates schema/property components; underscores are kept
+    # so suffix checks distinguish password_policy from smtp_password.
+    n="${n//[!a-z0-9_]/_}"
+    while [[ "$n" == *__* ]]; do n="${n//__/_}"; done
+    REPLY="${n#_}"; REPLY="${REPLY%_}"
+}
+
+sql_is_credential_name() {
+    sql_normalize_identifier "$1"
+    local n="$REPLY"
+    case "$n" in
+        password|passwd|passphrase|pwd|secret|credential|credentials|digest|plainpassword|encryptedpassword|storedkey|serverkey|passwordkey|passwordhash|passwdhash|pwhash|*_password|*_passwd|*_passphrase|*_pwd|*_secret|*_credential|*_credentials|*_digest|*_plainpassword|*_encryptedpassword|*_storedkey|*_serverkey|*_passwordkey|*_passwordhash|*_passwdhash|*_pwhash)
+            return 0 ;;
+    esac
+    return 1
+}
+
+sql_unquote_literal() {
+    local t="$1" raw prefix decoded=""
+    SQL_LITERAL=0
+    sql_trim "$t"; t="$REPLY"
+    # SQL national/escaped string prefixes: N'...' / E'...'. The bounded
+    # extractor intentionally supports only ordinary single-quoted literals.
+    if [[ "$t" =~ ^[nNeE]?\'(.*)\'$ ]]; then
+        raw="${BASH_REMATCH[1]}"
+        # Avoid ${var//pattern/replacement}: quote handling for a literal single
+        # quote changed across Bash compatibility levels. This loop behaves the
+        # same on Bash 4+ and converts SQL's doubled quote escape portably.
+        while [[ "$raw" == *"''"* ]]; do
+            prefix="${raw%%\'\'*}"
+            decoded+="$prefix'"
+            raw="${raw#*\'\'}"
+        done
+        REPLY="$decoded$raw"
+        SQL_LITERAL=1
+    else
+        REPLY="$t"
+    fi
+}
+
+# Quote- and parenthesis-aware comma splitter. Result -> SQL_TOKENS array.
+sql_split_csv() {
+    local s="$1" token="" ch next
+    local i=0 in_quote=0 depth=0
+    SQL_TOKENS=()
+    while [ "$i" -lt "${#s}" ]; do
+        ch="${s:i:1}"
+        if [ "$ch" = "'" ]; then
+            next="${s:i+1:1}"
+            if [ "$in_quote" -eq 1 ] && [ "$next" = "'" ]; then
+                token+="''"; i=$((i + 2)); continue
+            fi
+            if [ "$in_quote" -eq 1 ]; then in_quote=0; else in_quote=1; fi
+            token+="$ch"; i=$((i + 1)); continue
+        fi
+        if [ "$in_quote" -eq 0 ]; then
+            case "$ch" in
+                '(') depth=$((depth + 1)) ;;
+                ')') [ "$depth" -gt 0 ] && depth=$((depth - 1)) ;;
+                ',')
+                    if [ "$depth" -eq 0 ]; then
+                        sql_trim "$token"; SQL_TOKENS+=("$REPLY")
+                        token=""; i=$((i + 1)); continue
+                    fi
+                    ;;
+            esac
+        fi
+        token+="$ch"; i=$((i + 1))
+    done
+    [ "$in_quote" -eq 0 ] || return 1
+    sql_trim "$token"; SQL_TOKENS+=("$REPLY")
+    return 0
+}
+
+sql_table_key() {
+    sql_normalize_identifier "$1"
+    REPLY="$REPLY"
+}
+
+sql_existing_finding_contains() {
+    local file="$1" line="$2" value="$3" label f l preview
+    while IFS=$'\t' read -r label f l preview; do
+        [ "$f" = "$file" ] && [ "$l" = "$line" ] && [[ "$preview" == *"$value"* ]] && return 0
+    done <"$HIGH_FILE"
+    return 1
+}
+
+record_sql_finding() {
+    local label="$1" file="$2" line="$3" field="$4" value="$5"
+    sql_trim "$value"; value="$REPLY"
+    [ -n "$value" ] || return 1
+    is_false_positive "$value" && return 1
+    local dedup="$file|$line|${field,,}|$value"
+    [ -n "${SQL_REPORTED[$dedup]:-}" ] && return 1
+    SQL_REPORTED["$dedup"]=1
+    sql_existing_finding_contains "$file" "$line" "$value" && return 1
+    record_finding HIGH "content/$label" "$file" "$line" "$(sanitize "$field=$value")"
+    return 0
+}
+
+sql_store_create_table() {
+    local stmt="$1" raw_table table base cols entry first normalized joined="" sep=$'\x1f'
+    # Covers CREATE TABLE, CREATE MEMORY TABLE, CREATE TEMP TABLE, etc., with
+    # optional IF NOT EXISTS. Constraints are ignored; only column order matters.
+    local re="^[[:space:]]*CREATE[[:space:]]+((GLOBAL|LOCAL|MEMORY|CACHED|TEMP|TEMPORARY|UNLOGGED)[[:space:]]+)?TABLE[[:space:]]+(IF[[:space:]]+NOT[[:space:]]+EXISTS[[:space:]]+)?([^[:space:]\(]+)[[:space:]]*\((.*)\)[[:space:]]*$"
+    [[ "$stmt" =~ $re ]] || return 1
+    raw_table="${BASH_REMATCH[4]}"; cols="${BASH_REMATCH[5]}"
+    sql_table_key "$raw_table"; table="$REPLY"
+    [ -n "$table" ] || return 1
+    sql_split_csv "$cols" || return 1
+    for entry in "${SQL_TOKENS[@]}"; do
+        sql_trim "$entry"; entry="$REPLY"
+        first="${entry%%[[:space:]]*}"
+        sql_normalize_identifier "$first"; normalized="$REPLY"
+        case "$normalized" in
+            ''|constraint|primary|unique|foreign|check|key) continue ;;
+        esac
+        if [ -n "$joined" ]; then joined+="$sep"; fi
+        joined+="$normalized"
+    done
+    [ -n "$joined" ] || return 1
+    SQL_TABLE_COLUMNS["$table"]="$joined"
+    # Also retain the unqualified table name for dumps that qualify CREATE but
+    # omit the schema on INSERT (or vice versa).
+    sql_normalize_identifier "${raw_table##*.}"; base="$REPLY"
+    [ -n "$base" ] && SQL_TABLE_COLUMNS["$base"]="$joined"
+    return 0
+}
+
+sql_extract_property_tuples() {
+    local stmt="$1" file="$2" line="$3" values_group key value matched=0 i
+    [[ "$stmt" =~ VALUES[[:space:]]*\((.*)\)[[:space:]]*$ ]] || return 1
+    values_group="${BASH_REMATCH[1]}"
+    sql_split_csv "$values_group" || return 1
+    local -a tuple_values=("${SQL_TOKENS[@]}")
+    # Examine every adjacent string-literal pair. This intentionally requires
+    # the first literal to be a credential-bearing property name; generic
+    # key/value rows and arbitrary SQL strings do not match.
+    for ((i=0; i+1<${#tuple_values[@]}; i++)); do
+        sql_unquote_literal "${tuple_values[$i]}"; key="$REPLY"
+        [ "$SQL_LITERAL" -eq 1 ] || continue
+        sql_is_credential_name "$key" || continue
+        sql_unquote_literal "${tuple_values[$((i+1))]}"; value="$REPLY"
+        [ "$SQL_LITERAL" -eq 1 ] || continue
+        record_sql_finding sql_property_credential "$file" "$line" "$key" "$value" && matched=1
+    done
+    [ "$matched" -eq 1 ]
+}
+
+sql_extract_ddl_password() {
+    local stmt="$1" file="$2" line="$3" value="" field="sql_password"
+    if [[ "$stmt" =~ ^[[:space:]]*SET[[:space:]]+PASSWORD([[:space:]]|$) ]]; then
+        if [[ "$stmt" =~ SET[[:space:]]+PASSWORD([[:space:]]+FOR[[:space:]]+[^=[:space:]]+)?[[:space:]]*=[[:space:]]*[nNeE]?\'([^\']+)\' ]]; then
+            value="${BASH_REMATCH[2]}"; field="set_password"
+        elif [[ "$stmt" =~ SET[[:space:]]+PASSWORD([[:space:]]+FOR[[:space:]]+[^=[:space:]]+)?[[:space:]]*=[[:space:]]*PASSWORD[[:space:]]*\([[:space:]]*[nNeE]?\'([^\']+)\'[[:space:]]*\) ]]; then
+            value="${BASH_REMATCH[2]}"; field="set_password"
+        fi
+    elif [[ "$stmt" =~ ^[[:space:]]*(CREATE|ALTER)[[:space:]]+(USER|LOGIN|ROLE)[[:space:]] ]]; then
+        if [[ "$stmt" =~ PASSWORD[[:space:]]+DIGEST[[:space:]]*=?[[:space:]]*[nNeE]?\'([^\']+)\' ]]; then
+            value="${BASH_REMATCH[1]}"; field="password_digest"
+        elif [[ "$stmt" =~ IDENTIFIED[[:space:]]+(WITH[[:space:]]+[^[:space:]]+[[:space:]]+)?BY[[:space:]]+[nNeE]?\'([^\']+)\' ]]; then
+            value="${BASH_REMATCH[2]}"; field="identified_by"
+        elif [[ "$stmt" =~ (WITH[[:space:]]+)?PASSWORD[[:space:]]*=[[:space:]]*[nNeE]?\'([^\']+)\' ]]; then
+            value="${BASH_REMATCH[2]}"
+        elif [[ "$stmt" =~ (WITH[[:space:]]+)?PASSWORD[[:space:]]+[nNeE]?\'([^\']+)\' ]]; then
+            value="${BASH_REMATCH[2]}"
+        fi
+    fi
+    [ -n "$value" ] || return 1
+    record_sql_finding sql_ddl_password "$file" "$line" "$field" "$value"
+}
+
+sql_extract_insert_columns() {
+    local stmt="$1" file="$2" line="$3" raw_table table col_group values_group
+    local re="^[[:space:]]*INSERT[[:space:]]+INTO[[:space:]]+([^[:space:]\(]+)[[:space:]]*(\([^\)]*\))?[[:space:]]+VALUES[[:space:]]*\((.*)\)[[:space:]]*$"
+    [[ "$stmt" =~ $re ]] || return 1
+    raw_table="${BASH_REMATCH[1]}"; col_group="${BASH_REMATCH[2]}"; values_group="${BASH_REMATCH[3]}"
+
+    local -a columns=() values=()
+    local raw normalized token value i matched=0 sep=$'\x1f'
+    if [ -n "$col_group" ]; then
+        raw="${col_group#\(}"; raw="${raw%\)}"
+        sql_split_csv "$raw" || return 1
+        for token in "${SQL_TOKENS[@]}"; do
+            sql_normalize_identifier "$token"; columns+=("$REPLY")
+        done
+    else
+        sql_table_key "$raw_table"; normalized="$REPLY"
+        raw="${SQL_TABLE_COLUMNS[$normalized]:-}"
+        if [ -z "$raw" ]; then
+            sql_normalize_identifier "${raw_table##*.}"; normalized="$REPLY"
+            raw="${SQL_TABLE_COLUMNS[$normalized]:-}"
+        fi
+        [ -n "$raw" ] || return 1
+        IFS="$sep" read -r -a columns <<<"$raw"
+    fi
+
+    sql_split_csv "$values_group" || return 1
+    values=("${SQL_TOKENS[@]}")
+    [ "${#columns[@]}" -eq "${#values[@]}" ] || return 1
+    for ((i=0; i<${#columns[@]}; i++)); do
+        sql_is_credential_name "${columns[$i]}" || continue
+        sql_unquote_literal "${values[$i]}"; value="$REPLY"
+        [ "$SQL_LITERAL" -eq 1 ] || continue
+        record_sql_finding sql_insert_credential "$file" "$line" "${columns[$i]}" "$value" && matched=1
+    done
+    [ "$matched" -eq 1 ]
+}
+
+process_sql_statement() {
+    local stmt="$1" file="$2" line="$3"
+    sql_trim "$stmt"; stmt="$REPLY"
+    [ -n "$stmt" ] || return 0
+    # SQL comments are not executable credentials. Leading block comments are
+    # conservatively ignored rather than stripped with an unsafe regex.
+    [[ "$stmt" =~ ^(--|#|/\*) ]] && return 0
+    sql_store_create_table "$stmt" || true
+    sql_extract_ddl_password "$stmt" "$file" "$line" || true
+    sql_extract_property_tuples "$stmt" "$file" "$line" || true
+    sql_extract_insert_columns "$stmt" "$file" "$line" || true
+}
+
+is_sql_like_file() {
+    local file="$1" ext="${1##*.}"
+    ext="${ext,,}"
+    case "$ext" in
+        sql|ddl|dump|psql|pgsql|plsql|tsql|cql|sqlproj) return 0 ;;
+        script|txt|text|bak|backup|old|log)
+            grep -qiE -m1 '^[[:space:]]*(CREATE([[:space:]]+(GLOBAL|LOCAL|MEMORY|CACHED|TEMP|TEMPORARY|UNLOGGED))?[[:space:]]+(TABLE|USER|LOGIN|ROLE)|ALTER[[:space:]]+(USER|LOGIN|ROLE|TABLE)|INSERT[[:space:]]+INTO|SET[[:space:]]+(DATABASE|PASSWORD)|COPY[[:space:]])' "$file" 2>/dev/null
+            return $?
+            ;;
+    esac
+    return 1
+}
+
+scan_sql_file() {
+    local file="$1" statement="" line start_line=1 line_no=0 stmt_lines=0
+    local ch next i in_quote=0 dropping=0 limit_reported=0
+    SQL_TABLE_COLUMNS=()
+    SQL_REPORTED=()
+    while IFS= read -r line || [ -n "$line" ]; do
+        line_no=$((line_no + 1))
+        # HSQLDB .script dumps commonly omit semicolons and use one statement
+        # per line. A fresh SQL verb therefore closes the previous unquoted
+        # statement; continuation lines such as VALUES (...) remain attached.
+        if { [ -n "$statement" ] || [ "$dropping" -eq 1 ]; } && [ "$in_quote" -eq 0 ] &&
+           [[ "$line" =~ ^[[:space:]]*(CREATE|ALTER|INSERT|SET|GRANT|COPY|UPDATE|DELETE|DROP|MERGE)[[:space:]] ]]; then
+            [ "$dropping" -eq 1 ] || process_sql_statement "$statement" "$file" "$start_line"
+            statement=""; stmt_lines=0; dropping=0
+        fi
+        [ -n "$statement" ] || start_line="$line_no"
+        stmt_lines=$((stmt_lines + 1))
+        i=0
+        while [ "$i" -lt "${#line}" ]; do
+            ch="${line:i:1}"
+            if [ "$ch" = "'" ]; then
+                next="${line:i+1:1}"
+                if [ "$in_quote" -eq 1 ] && [ "$next" = "'" ]; then
+                    [ "$dropping" -eq 1 ] || statement+="''"
+                    i=$((i + 2)); continue
+                fi
+                if [ "$in_quote" -eq 1 ]; then in_quote=0; else in_quote=1; fi
+            fi
+            if [ "$dropping" -eq 0 ]; then statement+="$ch"; fi
+            if [ "$in_quote" -eq 0 ] && [ "$ch" = ';' ]; then
+                [ "$dropping" -eq 1 ] || process_sql_statement "${statement%;}" "$file" "$start_line"
+                statement=""; stmt_lines=0; dropping=0; start_line="$line_no"
+            elif [ "$dropping" -eq 0 ] &&
+                 { [ "${#statement}" -gt "$SQL_MAX_STATEMENT_BYTES" ] || [ "$stmt_lines" -gt "$SQL_MAX_STATEMENT_LINES" ]; }; then
+                if [ "$limit_reported" -eq 0 ]; then
+                    record_skip "$file" "SQL statement exceeds parser limit (line $start_line)"
+                    limit_reported=1
+                fi
+                dropping=1; statement=""
+            fi
+            i=$((i + 1))
+        done
+        [ -z "$statement" ] || statement+=$'\n'
+    done <"$file"
+    if [ "$dropping" -eq 0 ] && [ "$in_quote" -eq 0 ] && [ -n "$statement" ]; then
+        process_sql_statement "$statement" "$file" "$start_line"
+    fi
+}
+
 # Scan one file. Handles size, binary, dedup, and pattern matching.
 scan_file() {
     local file="$1" source_label="${2:-content}"
@@ -1506,6 +1816,14 @@ scan_file() {
             fi
             ;;
     esac
+
+    # SQL-aware supplement: understands DDL password clauses, key/value
+    # property tuples, and INSERT rows whose credential columns are declared
+    # explicitly or by an earlier CREATE TABLE statement. It runs only after
+    # the normal readability/binary/size gates above.
+    if is_sql_like_file "$file"; then
+        scan_sql_file "$file"
+    fi
 }
 
 # ============================================================================

@@ -1995,6 +1995,52 @@ if !errorlevel!==0 (
         call :AddHigh "!sLabel!/credential_match" "!sPath!" "%%a" "Credential keyword found"
     )
 )
+call :ScanSqlBestEffort "!sPath!" "!sLabel!"
+goto :EOF
+
+:: Native-CMD best-effort SQL supplement. This intentionally stays line-based:
+:: findstr cannot safely assemble quoted multi-line SQL or map positional INSERT
+:: values without corrupting !, %% and quote characters. The PowerShell and Bash
+:: implementations provide the full bounded parser.
+:ScanSqlBestEffort
+set "qPath=%~1"
+set "qLabel=%~2"
+set "qSql=0"
+for %%I in ("%~1") do set "qExt=%%~xI"
+for %%E in (.sql .ddl .dump .psql .pgsql .plsql .tsql .cql .sqlproj) do if /I "!qExt!"=="%%E" set "qSql=1"
+if /I "!qExt!"==".script" goto SqlSignatureGate
+if /I "!qExt!"==".txt" goto SqlSignatureGate
+if /I "!qExt!"==".text" goto SqlSignatureGate
+if /I "!qExt!"==".bak" goto SqlSignatureGate
+if /I "!qExt!"==".backup" goto SqlSignatureGate
+if /I "!qExt!"==".old" goto SqlSignatureGate
+if /I "!qExt!"==".log" goto SqlSignatureGate
+goto SqlGateDone
+
+:SqlSignatureGate
+findstr /I /M /R /C:"^[ ]*CREATE .*TABLE" /C:"^[ ]*CREATE .*USER" /C:"^[ ]*CREATE .*LOGIN" /C:"^[ ]*CREATE .*ROLE" /C:"^[ ]*ALTER .*USER" /C:"^[ ]*ALTER .*LOGIN" /C:"^[ ]*ALTER .*ROLE" /C:"^[ ]*INSERT .*INTO" /C:"^[ ]*SET .*PASSWORD" "!qPath!" >nul 2>&1
+if !errorlevel!==0 set "qSql=1"
+
+:SqlGateDone
+if "!qSql!"=="0" goto :EOF
+
+:: DDL forms: CREATE/ALTER USER|LOGIN|ROLE and SET PASSWORD. Anchoring the SQL
+:: verb avoids reporting commented examples that merely mention these clauses.
+for /f "tokens=1 delims=:" %%a in ('findstr /I /N /R /C:"^[ ]*CREATE .*USER .*PASSWORD" /C:"^[ ]*ALTER .*USER .*PASSWORD" /C:"^[ ]*CREATE .*LOGIN .*PASSWORD" /C:"^[ ]*ALTER .*LOGIN .*PASSWORD" /C:"^[ ]*CREATE .*ROLE .*PASSWORD" /C:"^[ ]*ALTER .*ROLE .*PASSWORD" /C:"^[ ]*CREATE .*USER .*IDENTIFIED .*BY" /C:"^[ ]*ALTER .*USER .*IDENTIFIED .*BY" /C:"^[ ]*SET .*PASSWORD" "!qPath!" 2^>nul') do (
+    call :AddHigh "!qLabel!/sql_ddl_password" "!qPath!" "%%a" "SQL credential clause found"
+)
+
+:: Same-line property tuples. Requiring the credential token to be followed by
+:: a quote avoids obvious fields such as password_policy.
+for /f "tokens=1 delims=:" %%a in ('findstr /I /N /C:"VALUES" "!qPath!" 2^>nul ^| findstr /I /C:"password'" /C:"passwd'" /C:"passphrase'" /C:"pwd'" /C:"secret'" /C:"credential'" /C:"credentials'" /C:"digest'" /C:"storedkey'" /C:"serverkey'" /C:"passwordkey'"') do (
+    call :AddHigh "!qLabel!/sql_property_credential" "!qPath!" "%%a" "SQL credential property tuple found"
+)
+
+:: Explicit-column INSERT rows only. Native Batch deliberately does not infer
+:: positional values from a preceding CREATE TABLE declaration.
+for /f "tokens=1 delims=:" %%a in ('findstr /I /N /R /C:"INSERT INTO .*) *VALUES" "!qPath!" 2^>nul ^| findstr /I /C:"password" /C:"passwd" /C:"passphrase" /C:"pwd" /C:"secret" /C:"credential" /C:"digest" /C:"storedkey" /C:"serverkey" /C:"passwordkey"') do (
+    call :AddHigh "!qLabel!/sql_insert_credential" "!qPath!" "%%a" "SQL explicit-column credential row found"
+)
 goto :EOF
 
 :WriteSummary

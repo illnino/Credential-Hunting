@@ -274,6 +274,25 @@ For example:
 
 The default maximum file size is **5 MB**. Increase it when credentials may live in larger logs, dumps, or configuration exports, or disable the cap when appropriate.
 
+On Linux and PowerShell, Stage 5 also performs bounded SQL-aware credential
+extraction. In addition to ordinary `password=value` matches, it recognizes
+common `CREATE/ALTER USER|LOGIN|ROLE` password clauses, credential
+property/value tuples, explicit-column `INSERT ... VALUES` rows, and positional
+inserts whose column order is available from an earlier `CREATE TABLE`
+statement. The parser does not execute SQL and is limited to 64 KiB or 200 lines
+per statement.
+
+The native CMD (`credshunter.bat`) version provides best-effort, same-line SQL
+detection for DDL password clauses, property tuples, and explicit-column
+inserts. It deliberately does not join multi-line statements or infer
+positional inserts because doing so safely would require PowerShell and would
+break the script's CMD-only operation.
+
+Large SQL dumps still follow the normal 5 MB file limit. For Bash, use for
+example `--max-size 50` or `--no-size-limit`; for PowerShell/CMD use
+`-MaxFileSizeMB 50` or `-NoSizeLimit`. Add `--all` (Bash) or `-All`
+(PowerShell/CMD) when the SQL-like file has an unknown extension.
+
 The summary row `Environment credential findings` counts unique matched environment variable names. It is a subset of the existing `HIGH`/`KEY` totals and is not added to them again.
 
 ---
