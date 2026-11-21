@@ -311,6 +311,7 @@ Set-Glyphs
 #  Finding storage
 # ----------------------------------------------------------------------------
 $script:HighFindings     = [System.Collections.Generic.List[object]]::new()
+$script:ReviewFindings   = [System.Collections.Generic.List[object]]::new()
 $script:KeyFindings      = [System.Collections.Generic.List[object]]::new()
 $script:Interesting      = [System.Collections.Generic.List[object]]::new()
 $script:Guaranteed       = [System.Collections.Generic.List[object]]::new()
@@ -325,6 +326,7 @@ $script:LocationsChecked = [System.Collections.Generic.List[object]]::new()
 $script:CheckedHashes    = [System.Collections.Generic.HashSet[string]]::new()
 $script:SkippedFiles     = [System.Collections.Generic.List[object]]::new()
 $script:FindingHashes    = [System.Collections.Generic.HashSet[string]]::new()
+$script:ReviewHashes      = [System.Collections.Generic.HashSet[string]]::new()
 $script:InterestingHashes = [System.Collections.Generic.HashSet[string]]::new()
 $script:ScannedPaths     = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 
@@ -1289,6 +1291,7 @@ function Begin-Stage { param([int]$N)
     $script:StageBeforeCounts[$N] = @{
         Guaranteed = $script:Guaranteed.Count
         High       = $script:HighFindings.Count
+        Review     = $script:ReviewFindings.Count
         Key        = $script:KeyFindings.Count
         Interest   = $script:Interesting.Count
         Name       = $script:SuspiciousNamesFound.Count
@@ -1302,11 +1305,12 @@ function End-Stage { param([int]$N, [string]$Title)
     $elapsed = ([DateTime]::UtcNow - $script:StageStartTime[$N]).TotalSeconds
     $dGuar = $script:Guaranteed.Count           - $before.Guaranteed
     $dHigh = $script:HighFindings.Count         - $before.High
+    $dReview = $script:ReviewFindings.Count     - $before.Review
     $dKey  = $script:KeyFindings.Count          - $before.Key
     $dInt  = $script:Interesting.Count          - $before.Interest
     $dName = $script:SuspiciousNamesFound.Count - $before.Name
     $dGit  = $script:GitRepositories.Count      - $before.Git
-    $total = $dGuar + $dHigh + $dKey + $dInt + $dName + $dGit
+    $total = $dGuar + $dHigh + $dReview + $dKey + $dInt + $dName + $dGit
 
     $header = "Stage $N -- $Title"
     $tw = 72
@@ -1328,6 +1332,12 @@ function End-Stage { param([int]$N, [string]$Title)
         if ($dHigh -gt 0) {
             $script:HighFindings | Select-Object -Last $dHigh | ForEach-Object {
                 Write-Host ("  [{0,-8}]  {1}" -f 'HIGH', $_.Path)
+                if ($_.Preview) { Write-Host ("              $($script:CD){0}$($script:CNC)" -f (Format-LivePreview $_.Preview)) }
+            }
+        }
+        if ($dReview -gt 0) {
+            $script:ReviewFindings | Select-Object -Last $dReview | ForEach-Object {
+                Write-Host ("  [{0,-8}]  {1}" -f 'REVIEW', $_.Path)
                 if ($_.Preview) { Write-Host ("              $($script:CD){0}$($script:CNC)" -f (Format-LivePreview $_.Preview)) }
             }
         }
@@ -1532,6 +1542,43 @@ function Add-Finding {
     if ($script:InStage1) {
         Write-Stage1Finding -Tier $Bucket -Label $Label -Path $Path -LineNumber $LineNumber -Preview $Preview
     }
+}
+
+function Add-ReviewFinding {
+    param(
+        [string]$Label,
+        [string]$Path,
+        [int]   $LineNumber,
+        [string]$Preview
+    )
+    $key = "$Label|$Path|$LineNumber"
+    if (-not $script:ReviewHashes.Add($key)) { return }
+    $obj = [PSCustomObject]@{
+        Label = $Label; Path = $Path; LineNumber = $LineNumber; Preview = $Preview
+    }
+    $script:ReviewFindings.Add($obj)
+    if ($script:InStage1) {
+        Write-Stage1Finding -Tier 'Review' -Label $Label -Path $Path -LineNumber $LineNumber -Preview $Preview
+    }
+}
+
+function Test-PowerShellHistoryPasswordPhrase {
+    param([string]$Line)
+    # History-only heuristic for commands that print a natural-language note
+    # containing a likely password, e.g. echo "... password i6yuT6tym@".
+    # Keep this out of the global credential patterns: prose in configs/docs
+    # would otherwise create excessive false positives.
+    if ($Line -notmatch '(?i)^\s*(?:echo|write-output|write-host)\b') { return $null }
+    $m = [regex]::Match($Line,
+        '(?i)(?<![A-Za-z])(?:password|passwd|passphrase|pwd)(?![A-Za-z0-9])\s*(?:is\s+|was\s+|[:=]\s*)?["'']?(?<value>[^\s"'']{6,})')
+    if (-not $m.Success) { return $null }
+    $value = $m.Groups['value'].Value.TrimEnd('.', ',', ';', '!', '?', ')', ']', '}')
+    if (Test-FalsePositive -Value $value) { return $null }
+    # Require a credential-like token rather than ordinary prose. This accepts
+    # mixed-case/digit/symbol values while rejecting common words such as
+    # "incorrect" and "message".
+    if ($value -notmatch '(?=.*[A-Z])(?=.*[a-z])(?=.*\d|.*[^A-Za-z0-9])') { return $null }
+    return $m
 }
 
 function Add-Interesting { param([string]$Category, [string]$Path, [string]$Tag = 'INTEREST')
@@ -1964,6 +2011,14 @@ function Invoke-ScanFile { param([string]$FullPath, [string]$SourceLabel = 'cont
 
             # Cheap per-line keyword check (regex IsMatch on a short string is fast)
             if (-not $script:KeywordPrefilter.IsMatch($line)) { continue }
+
+            if ($SourceLabel -eq 'powershell_history') {
+                $historyMatch = Test-PowerShellHistoryPasswordPhrase -Line $line
+                if ($null -ne $historyMatch) {
+                    Add-ReviewFinding -Label 'powershell_history/password_phrase' `
+                        -Path $FullPath -LineNumber $i -Preview (Format-Preview $line)
+                }
+            }
 
         foreach ($p in $script:CredPatterns) {
             $m = $p.Regex.Match($line)
@@ -3486,6 +3541,8 @@ function Write-FullSummary {
 
     try { Write-FindingsSection -Title "Reusable credentials" -List $script:HighFindings -Tag "HIGH" -Color $script:CR }
     catch { Write-Warn ("summary section error (Reusable credentials): " + $_.Exception.Message) }
+    try { Write-FindingsSection -Title "Review candidates" -List $script:ReviewFindings -Tag "REVIEW" -Color $script:CY }
+    catch { Write-Warn ("summary section error (Review candidates): " + $_.Exception.Message) }
     try { Write-FindingsSection -Title "Private keys & authentication material" -List $script:KeyFindings -Tag "KEY" -Color $script:CM }
     catch { Write-Warn ("summary section error (Private keys): " + $_.Exception.Message) }
 
@@ -3558,6 +3615,7 @@ function Write-FullSummary {
     Write-Section "Summary"
     $nGuar  = $script:Guaranteed.Count
     $nHigh  = $script:HighFindings.Count
+    $nReview = $script:ReviewFindings.Count
     $nKey   = $script:KeyFindings.Count
     $nOffice = @($script:Interesting | Where-Object { $_.Tag -eq 'OFFICE' }).Count
     $nSql    = @($script:Interesting | Where-Object { $_.Tag -eq 'SQL' }).Count
@@ -3569,6 +3627,7 @@ function Write-FullSummary {
     $nSkip  = $script:SkippedFiles.Count
     Write-SummaryRow ($script:CBold + $script:CR) ("Confirmed credential containers " + $script:GWarn) $nGuar
     Write-SummaryRow $script:CR "Reusable credentials"               $nHigh
+    Write-SummaryRow $script:CY "Review candidates"                  $nReview
     Write-SummaryRow $script:CM "Private keys / auth material"        $nKey
     Write-SummaryRow $script:CB "Office documents"                    $nOffice
     Write-SummaryRow $script:CC "SQL / database files"                $nSql
@@ -3583,6 +3642,7 @@ function Write-FullSummary {
     Write-LogLine "Summary:"
     Write-LogLine "  Confirmed credential containers: $nGuar"
     Write-LogLine "  Reusable credentials:            $nHigh"
+    Write-LogLine "  Review candidates:               $nReview"
     Write-LogLine "  Private keys / material:         $nKey"
     Write-LogLine "  Office documents:               $nOffice"
     Write-LogLine "  SQL / database files:           $nSql"
