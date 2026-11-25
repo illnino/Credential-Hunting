@@ -2248,15 +2248,23 @@ function Test-KnownFile { param([string]$Path, [string]$Label)
 # FP filter would match. Saved sessions (PuTTY/KiTTY/WinSCP/RDP) are rare and
 # high-value; a silent miss (dropping a session that stores a password the
 # regex never recognised) is far worse than listing a handful of entries the
-# operator can eyeball. For each subkey we dump the host/user identity plus the
-# RAW value of any property whose NAME looks credential-bearing
+# operator can eyeball. We inspect both the Sessions container itself (some
+# collectors export direct values as `RegKey Name/RegKey Value`) and each
+# child subkey. For each item we dump the host/user identity plus the RAW value
+# of any property whose NAME looks credential-bearing
 # (Password/Passphrase/Pwd/Secret/Cred/ProxyPassword/...). A stored secret field
 # -> [HIGH] with the raw value; an identity-only session -> [INTEREST] review.
 function Write-RegistrySessionReview { param([string]$Root, [string]$Tool)
     if (-not (Test-Path $Root)) { return }
     Add-Checked -Label "${Tool}_sessions" -Path $Root
     try {
-        Get-ChildItem -LiteralPath $Root -ErrorAction SilentlyContinue | ForEach-Object {
+        # Get-ChildItem on the Registry provider returns child keys, not values
+        # stored directly on the key. Include the root item itself so layouts
+        # such as `Sessions\zachary = <plink command>` are not silently missed.
+        @(
+            Get-Item -LiteralPath $Root -ErrorAction SilentlyContinue
+            Get-ChildItem -LiteralPath $Root -ErrorAction SilentlyContinue
+        ) | ForEach-Object {
             $sess = $_.PSChildName
             try { $sess = [System.Uri]::UnescapeDataString($sess) } catch {}
             $p = Get-ItemProperty -LiteralPath $_.PSPath -ErrorAction SilentlyContinue
