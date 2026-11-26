@@ -1581,6 +1581,21 @@ function Test-PowerShellHistoryPasswordPhrase {
     return $m
 }
 
+function Test-PowerShellHistoryPositionalCredential {
+    param([string]$Line)
+    # Some admin tools accept a password positionally, so there is no
+    # `password=`, `-pass`, or other keyword for the normal pre-filter to see.
+    # Keep this as a REVIEW heuristic: the second token is only a lead until
+    # the operator confirms the tool's syntax.
+    $m = [regex]::Match($Line,
+        '(?i)^\s*(?<exe>[^\r\n]*?\.exe)\s+(?<value>[^\s"'']+)\s+cmd(?:\s|$)')
+    if (-not $m.Success) { return $null }
+    $value = $m.Groups['value'].Value
+    if ($value.Length -lt 6 -or (Test-FalsePositive -Value $value)) { return $null }
+    if ($value -notmatch '(?=.*[A-Z])(?=.*[a-z])(?=.*\d|.*[^A-Za-z0-9])') { return $null }
+    return $m
+}
+
 function Add-Interesting { param([string]$Category, [string]$Path, [string]$Tag = 'INTEREST')
     $normalizedTag = if ($Tag) { $Tag.ToUpperInvariant() } else { 'INTEREST' }
     if ($normalizedTag -notin @('INTEREST','OFFICE','SQL')) { $normalizedTag = 'INTEREST' }
@@ -2010,12 +2025,21 @@ function Invoke-ScanFile { param([string]$FullPath, [string]$SourceLabel = 'cont
             if ($llen -lt 6 -or $llen -gt $script:MaxLineLen) { continue }
 
             # Cheap per-line keyword check (regex IsMatch on a short string is fast)
-            if (-not $script:KeywordPrefilter.IsMatch($line)) { continue }
+            # PowerShell history also gets the positional-credential heuristic
+            # below. Its argument may be an opaque token with no password
+            # keyword, so do not let the generic pre-filter discard the line.
+            if (-not $script:KeywordPrefilter.IsMatch($line) -and
+                $SourceLabel -ne 'powershell_history') { continue }
 
             if ($SourceLabel -eq 'powershell_history') {
                 $historyMatch = Test-PowerShellHistoryPasswordPhrase -Line $line
                 if ($null -ne $historyMatch) {
                     Add-ReviewFinding -Label 'powershell_history/password_phrase' `
+                        -Path $FullPath -LineNumber $i -Preview (Format-Preview $line)
+                }
+                $positionalMatch = Test-PowerShellHistoryPositionalCredential -Line $line
+                if ($null -ne $positionalMatch) {
+                    Add-ReviewFinding -Label 'powershell_history/positional_credential' `
                         -Path $FullPath -LineNumber $i -Preview (Format-Preview $line)
                 }
             }
